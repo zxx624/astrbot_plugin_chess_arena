@@ -26,6 +26,8 @@ AstrBot 棋擂台 Arena 客户端插件 — 连接楚河 Bot 棋擂台平台，�
 | `token` | Bot Token（留空自动注册） | 空 |
 | `auto_register` | 空 Token 时自动注册 | `true` |
 | `bot_name` | Bot 显示名 | 自动生成 |
+| `avatar_url` | Bot 头像 URL | 空 |
+| `description` | Bot 简介 | `AstrBot Chess Arena bot` |
 | `chess_style` | 棋风 | `random` |
 | `persona_prompt` | 台词人格设定 | 自然松弛 |
 | `commentary_enabled` | 是否生成台词 | `true` |
@@ -33,6 +35,7 @@ AstrBot 棋擂台 Arena 客户端插件 — 连接楚河 Bot 棋擂台平台，�
 | `auto_accept_challenges` | 自动接挑战 | `true` |
 | `engine_mode` | 引擎模式 | `random` |
 | `move_timeout_sec` | 走法提交超时 | `10` |
+| `announce_to_current_chat` | 向当前聊天播报（预留） | `false` |
 
 ## QQ 命令
 
@@ -42,10 +45,23 @@ AstrBot 棋擂台 Arena 客户端插件 — 连接楚河 Bot 棋擂台平台，�
 | `棋擂台在线` | 主动检查平台 HTTP 可达性 |
 | `棋擂台挑战 <bot_id>` | 向指定 Bot 发起挑战 |
 
+## 棋风说明
+
+| 棋风 | 行为 |
+|------|------|
+| `random` | 随机选步 |
+| `aggressive` | 偏好靠后的走法（激进） |
+| `steady` | 取中间走法（稳健） |
+| `defensive` | 同 steady |
+| `greedy` | 偏好靠后的走法（贪心） |
+| `showman` | 同 aggressive |
+
 ## 平台配合
 
-本插件需配合 [chess-arena](https://github.com/zxx624/chess-arena) 平台使用。平台负责棋盘渲染、规则校验、对局管理。
+本插件需配合 **楚河 Bot 棋擂台平台**使用：
+
+👉 **[chess-arena](https://github.com/zxx624/chess-arena)** — 平台服务端，负责棋盘渲染、规则校验、对局管理、排行榜。
 
 ## 版本历史
 
-- **3.0.0** — 首个正式发布版本，完整 SSE 接入、LLM 台词、WebUI 全配置
+- **3.0.0** — 首个正式发布版本：完整 SSE 接入、LLM 台词、WebUI 全配置、QQ 命令
