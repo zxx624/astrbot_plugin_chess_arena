@@ -1,0 +1,83 @@
+{
+  "arena_base": {
+    "description": "棋擂台平台地址",
+    "type": "string",
+    "hint": "平台 HTTP/SSE Base URL，不要以 / 结尾",
+    "default": "http://127.0.0.1:8787"
+  },
+  "token": {
+    "description": "Bot 接入 Token，留空则自动注册；也可在 WebUI 手动修改",
+    "type": "string",
+    "hint": "自动注册成功后插件会尽量写回 runtime config；日志不会输出完整 token",
+    "default": ""
+  },
+  "auto_register": {
+    "description": "Token 为空时自动注册",
+    "type": "bool",
+    "hint": "启动时 POST /api/bots/register 获取 token 并尝试保存到 AstrBot runtime config",
+    "default": true
+  },
+  "bot_name": {
+    "description": "Bot 显示名称",
+    "type": "string",
+    "hint": "留空时使用 AstrBot/主机名生成默认名称",
+    "default": ""
+  },
+  "avatar_url": {
+    "description": "Bot 头像 URL",
+    "type": "string",
+    "default": ""
+  },
+  "description": {
+    "description": "Bot 简介",
+    "type": "string",
+    "default": "AstrBot Chess Arena bot"
+  },
+  "chess_style": {
+    "description": "棋风",
+    "type": "string",
+    "hint": "random/aggressive/steady/defensive/greedy/showman；V0.2 用于选步偏好和台词风格",
+    "default": "random"
+  },
+  "persona_prompt": {
+    "description": "下棋台词人格",
+    "type": "text",
+    "hint": "只用于生成短台词，不决定走法",
+    "default": "像群里真人下棋，自然、松弛、有一点胜负欲，不要像客服。"
+  },
+  "commentary_enabled": {
+    "description": "走棋时生成台词",
+    "type": "bool",
+    "default": true
+  },
+  "commentary_timeout_sec": {
+    "description": "台词生成超时秒数",
+    "type": "int",
+    "hint": "若可用 LLM provider，会在此超时内尝试生成；失败则使用本地模板，不影响走棋",
+    "default": 8
+  },
+  "auto_accept_challenges": {
+    "description": "自动接受挑战",
+    "type": "bool",
+    "hint": "收到 challenge_received 事件后自动 POST /api/challenges/{id}/accept",
+    "default": true
+  },
+  "engine_mode": {
+    "description": "引擎模式",
+    "type": "string",
+    "hint": "V0.2 支持 random/style：始终只从平台下发 legal_moves 中选择合法走法",
+    "default": "random"
+  },
+  "move_timeout_sec": {
+    "description": "走法提交超时秒数",
+    "type": "int",
+    "hint": "POST /api/matches/{match_id}/move 的超时时间",
+    "default": 10
+  },
+  "announce_to_current_chat": {
+    "description": "向当前聊天播报",
+    "type": "bool",
+    "hint": "预留字段；默认仅记录日志和响应命令，不主动向聊天发送事件",
+    "default": false
+  }
+}
