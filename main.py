@@ -35,6 +35,7 @@ class ChessArenaPlugin(Star):
         super().__init__(context)
         self.config = config or {}
         self.arena_base = str(self.config.get("arena_base") or "https://fazuo624.icu").rstrip("/")
+        self.arena_fallback_bases = self._parse_fallback_bases(self.config.get("arena_fallback_bases"))
         self.token = str(self.config.get("token") or "").strip()
         self.auto_register = bool(self.config.get("auto_register", True))
         configured_bot_name = str(self.config.get("bot_name") or "").strip()
@@ -91,19 +92,80 @@ class ChessArenaPlugin(Star):
             self._session = aiohttp.ClientSession(timeout=timeout)
         return self._session
 
-    async def _auto_register_bot(self) -> None:
+    def _candidate_arena_bases(self) -> list[str]:
+        bases = [self.arena_base, *self.arena_fallback_bases]
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for base in bases:
+            base = str(base or "").strip().rstrip("/")
+            if base and base not in seen:
+                seen.add(base)
+                deduped.append(base)
+        return deduped
+
+    @staticmethod
+    def _parse_fallback_bases(value: Any) -> list[str]:
+        if value is None or value == "":
+            raw_items = ["http://101.43.22.174:8787"]
+        elif isinstance(value, str):
+            raw_items = value.replace("\n", ",").split(",")
+        elif isinstance(value, (list, tuple)):
+            raw_items = list(value)
+        else:
+            raw_items = []
+        bases: list[str] = []
+        for item in raw_items:
+            base = str(item or "").strip().rstrip("/")
+            if base and base not in bases:
+                bases.append(base)
+        return bases
+
+    async def _request_text_with_fallback(
+        self,
+        method: str,
+        path: str,
+        *,
+        json_payload: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+        timeout: aiohttp.ClientTimeout | None = None,
+    ) -> tuple[str, int, str]:
         session = await self._get_session()
-        url = f"{self.arena_base}/api/bots/register"
+        last_error = ""
+        for base in self._candidate_arena_bases():
+            url = f"{base}{path}"
+            try:
+                async with session.request(method, url, json=json_payload, headers=headers, timeout=timeout) as resp:
+                    text = await resp.text()
+                    if resp.status >= 500 and base != self._candidate_arena_bases()[-1]:
+                        last_error = f"{base}: HTTP {resp.status} {text[:200]}"
+                        logger.warning("[ChessArena] %s %s 失败，尝试备用地址: %s", method, base, last_error)
+                        continue
+                    if base != self.arena_base:
+                        old = self.arena_base
+                        self.arena_base = base
+                        self.config["arena_base"] = base
+                        logger.warning("[ChessArena] 主地址不可用，已切换棋擂台地址: %s -> %s", old, base)
+                    return base, resp.status, text
+            except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
+                last_error = f"{base}: {exc}"
+                logger.warning("[ChessArena] 连接棋擂台失败，将尝试备用地址: %s", last_error)
+        raise RuntimeError(f"all arena bases failed for {method} {path}: {last_error}")
+
+    async def _auto_register_bot(self) -> None:
         payload = self._bot_settings_payload(include_client=True)
         logger.info("[ChessArena] token 为空，正在自动注册 Bot: %s", self.bot_name)
-        async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-            text = await resp.text()
-            if resp.status >= 400:
-                raise RuntimeError(f"register bot failed: HTTP {resp.status} {text[:200]}")
-            try:
-                data = json.loads(text) if text else {}
-            except json.JSONDecodeError as exc:
-                raise RuntimeError(f"register bot returned non-json: {text[:200]}") from exc
+        base, status, text = await self._request_text_with_fallback(
+            "POST",
+            "/api/bots/register",
+            json_payload=payload,
+            timeout=aiohttp.ClientTimeout(total=15),
+        )
+        if status >= 400:
+            raise RuntimeError(f"register bot failed: HTTP {status} {text[:200]}")
+        try:
+            data = json.loads(text) if text else {}
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"register bot returned non-json: {text[:200]}") from exc
 
         token = str(data.get("token") or "").strip()
         if not token:
@@ -117,30 +179,35 @@ class ChessArenaPlugin(Star):
         await self._save_registration_to_runtime_config(token)
 
     async def _verify_token(self) -> bool:
-        session = await self._get_session()
-        url = f"{self.arena_base}/api/bots/me"
         try:
-            async with session.get(url, headers=self._auth_headers(), timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                text = await resp.text()
-                if resp.status >= 400:
-                    logger.warning("[ChessArena] token 验证失败: HTTP %s %s", resp.status, text[:200])
-                    return False
-                logger.info("[ChessArena] token 验证成功: %s", self._short(json.loads(text) if text else {}))
-                return True
+            _base, status, text = await self._request_text_with_fallback(
+                "GET",
+                "/api/bots/me",
+                headers=self._auth_headers(),
+                timeout=aiohttp.ClientTimeout(total=10),
+            )
+            if status >= 400:
+                logger.warning("[ChessArena] token 验证失败: HTTP %s %s", status, text[:200])
+                return False
+            logger.info("[ChessArena] token 验证成功: %s", self._short(json.loads(text) if text else {}))
+            return True
         except Exception as exc:  # noqa: BLE001
             logger.warning("[ChessArena] token 验证异常: %s", exc)
             return False
 
     async def _patch_bot_settings(self) -> None:
-        session = await self._get_session()
-        url = f"{self.arena_base}/api/bots/me"
         payload = self._bot_settings_payload(include_client=False)
-        async with session.patch(url, json=payload, headers=self._auth_headers(), timeout=aiohttp.ClientTimeout(total=10)) as resp:
-            text = await resp.text()
-            if resp.status >= 400:
-                logger.warning("[ChessArena] 上报 Bot 设置失败: HTTP %s %s", resp.status, text[:200])
-                return
-            logger.info("[ChessArena] 已上报 Bot 设置: name=%s style=%s", self.bot_name, self.chess_style)
+        _base, status, text = await self._request_text_with_fallback(
+            "PATCH",
+            "/api/bots/me",
+            json_payload=payload,
+            headers=self._auth_headers(),
+            timeout=aiohttp.ClientTimeout(total=10),
+        )
+        if status >= 400:
+            logger.warning("[ChessArena] 上报 Bot 设置失败: HTTP %s %s", status, text[:200])
+            return
+        logger.info("[ChessArena] 已上报 Bot 设置: name=%s style=%s", self.bot_name, self.chess_style)
 
     def _bot_settings_payload(self, include_client: bool = False) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -182,6 +249,7 @@ class ChessArenaPlugin(Star):
         data = dict(self.config)
         data.update({
             "arena_base": self.arena_base,
+            "arena_fallback_bases": ",".join(self.arena_fallback_bases),
             "token": token,
             "auto_register": self.auto_register,
             "bot_name": self.bot_name,
@@ -269,31 +337,46 @@ class ChessArenaPlugin(Star):
 
     async def _connect_and_read_sse(self) -> None:
         session = await self._get_session()
-        url = f"{self.arena_base}/sse/bot?token={quote(self.token)}"
-        logger.info("[ChessArena] 正在连接 SSE: %s", self._safe_url(url))
-        async with session.get(url, headers={"Accept": "text/event-stream"}) as resp:
-            resp.raise_for_status()
-            self.state.connected = True
-            self.state.last_error = ""
-            logger.info("[ChessArena] SSE 已连接")
+        last_error = ""
+        for base in self._candidate_arena_bases():
+            url = f"{base}/sse/bot?token={quote(self.token)}"
+            logger.info("[ChessArena] 正在连接 SSE: %s", self._safe_url(url))
+            try:
+                async with session.get(url, headers={"Accept": "text/event-stream"}) as resp:
+                    if base != self.arena_base:
+                        old = self.arena_base
+                        self.arena_base = base
+                        self.config["arena_base"] = base
+                        logger.warning("[ChessArena] SSE 已切换棋擂台地址: %s -> %s", old, base)
+                    return await self._read_sse_response(resp)
+            except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
+                last_error = f"{base}: {exc}"
+                logger.warning("[ChessArena] SSE 地址不可用，尝试下一个: %s", last_error)
+        raise RuntimeError(f"all arena SSE bases failed: {last_error}")
 
-            event_name: str | None = None
-            data_lines: list[str] = []
-            async for raw in resp.content:
-                if self._stopping.is_set():
-                    break
-                line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
-                if line == "":
-                    await self._dispatch_sse_event(event_name, "\n".join(data_lines))
-                    event_name = None
-                    data_lines = []
-                elif line.startswith(":"):
-                    continue
-                elif line.startswith("event:"):
-                    event_name = line[6:].strip()
-                elif line.startswith("data:"):
-                    data_lines.append(line[5:].lstrip())
-            self.state.connected = False
+    async def _read_sse_response(self, resp: aiohttp.ClientResponse) -> None:
+        resp.raise_for_status()
+        self.state.connected = True
+        self.state.last_error = ""
+        logger.info("[ChessArena] SSE 已连接")
+
+        event_name: str | None = None
+        data_lines: list[str] = []
+        async for raw in resp.content:
+            if self._stopping.is_set():
+                break
+            line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
+            if line == "":
+                await self._dispatch_sse_event(event_name, "\n".join(data_lines))
+                event_name = None
+                data_lines = []
+            elif line.startswith(":"):
+                continue
+            elif line.startswith("event:"):
+                event_name = line[6:].strip()
+            elif line.startswith("data:"):
+                data_lines.append(line[5:].lstrip())
+        self.state.connected = False
 
     async def _dispatch_sse_event(self, sse_event: str | None, data: str) -> None:
         if not data and not sse_event:
@@ -495,14 +578,16 @@ class ChessArenaPlugin(Star):
     async def arena_online(self, event: AstrMessageEvent):
         """主动检查棋擂台 HTTP 可达性。"""
         try:
-            session = await self._get_session()
-            url = f"{self.arena_base}/api/bots/me"
-            async with session.get(url, headers=self._auth_headers(), timeout=aiohttp.ClientTimeout(total=5)) as resp:
-                text = await resp.text()
-                if resp.status >= 400:
-                    yield event.plain_result(f"棋擂台在线检查失败：HTTP {resp.status} {text[:200]}")
-                else:
-                    yield event.plain_result(f"棋擂台在线检查成功：HTTP {resp.status} {text[:200]}")
+            base, status, text = await self._request_text_with_fallback(
+                "GET",
+                "/api/bots/me",
+                headers=self._auth_headers(),
+                timeout=aiohttp.ClientTimeout(total=5),
+            )
+            if status >= 400:
+                yield event.plain_result(f"棋擂台在线检查失败：{base} HTTP {status} {text[:200]}")
+            else:
+                yield event.plain_result(f"棋擂台在线检查成功：{base} HTTP {status} {text[:200]}")
         except Exception as exc:  # noqa: BLE001
             yield event.plain_result(f"棋擂台在线检查异常：{exc}")
 

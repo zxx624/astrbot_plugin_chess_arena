@@ -65,3 +65,8 @@ AstrBot 棋擂台 Arena 客户端插件 — 连接楚河 Bot 棋擂台平台，�
 ## 版本历史
 
 - **3.0.0** — 首个正式发布版本：完整 SSE 接入、LLM 台词、WebUI 全配置、QQ 命令
+
+
+## 网络兜底
+
+如果某些 Windows/云服务器网络访问 `https://fazuo624.icu:443` 报 `Connection reset by peer` / `WinError 64 指定的网络名不再可用`，插件会自动尝试 `arena_fallback_bases`，默认是直连 `http://101.43.22.174:8787`，注册成功后会把实际可用地址写回配置。
