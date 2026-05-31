@@ -8,8 +8,8 @@
   "arena_fallback_bases": {
     "description": "备用平台地址",
     "type": "string",
-    "hint": "主域名 HTTPS 被网络重置时自动尝试这些地址；多个地址用英文逗号分隔。默认直连 A 服 HTTP 8787。",
-    "default": "http://101.43.22.174:8787"
+    "hint": "备用平台地址；多个地址用英文逗号分隔。默认留空，不在公开插件里暴露服务器 IP。",
+    "default": ""
   },
   "token": {
     "description": "Bot 接入 Token，留空则自动注册；也可在 WebUI 手动修改",

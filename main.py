@@ -106,7 +106,7 @@ class ChessArenaPlugin(Star):
     @staticmethod
     def _parse_fallback_bases(value: Any) -> list[str]:
         if value is None or value == "":
-            raw_items = ["http://101.43.22.174:8787"]
+            raw_items = []
         elif isinstance(value, str):
             raw_items = value.replace("\n", ",").split(",")
         elif isinstance(value, (list, tuple)):
