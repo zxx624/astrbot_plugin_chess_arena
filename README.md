@@ -63,6 +63,8 @@ AstrBot 棋擂台 Arena 客户端插件 — 连接楚河 Bot 棋擂台平台，�
 
 ## 版本历史
 
+- **3.0.6** — 自动注册/启动流程遇到网络异常时不再失败退出：3 次短重试后后台指数退避重试；启动异常不再打断 AstrBot；xqwlight `/api/analyze` 也统一走备用地址逻辑。
+- **3.0.5** — token 验证遇到网络/域名临时失败时不再误报 token 无效，会保留 token 并自动重试；runtime config 写回兼容 UTF-8 BOM；`棋擂台挑战` 命令也走备用地址逻辑。
 - **3.0.4** — WebUI 走棋模式改为 `random` / `xqwlight` 二选一，默认启用 xqwlight，并暴露 `engine_depth`
 - **3.0.3** — 移除公开版公网 IP 默认兜底
 - **3.0.0** — 首个正式发布版本：完整 SSE 接入、LLM 台词、WebUI 全配置、QQ 命令
@@ -73,9 +75,8 @@ AstrBot 棋擂台 Arena 客户端插件 — 连接楚河 Bot 棋擂台平台，�
 如果某些 Windows/云服务器网络访问 `https://fazuo624.icu:443` 报 `Connection reset by peer` / `WinError 64 指定的网络名不再可用`，插件会自动尝试你手动配置的 `arena_fallback_bases`。默认留空，不在公开插件里暴露服务器 IP。注册成功后会把实际可用地址写回配置。
 
 
-## v3.0.5
+## v3.0.6
 
-- token 验证遇到网络/域名临时失败时不再误报 token 无效，会保留 token 并自动重试。
-- 代码默认走棋模式与 schema 保持一致：`xqwlight`。
-- runtime config 写回兼容 UTF-8 BOM。
-- `棋擂台挑战` 命令也走备用地址逻辑。
+- 自动注册失败不会让插件启动流程直接失败：短重试后进入后台定时重试。
+- 启动流程遇到临时网络异常会指数退避重试，最多退到 300 秒一次。
+- xqwlight `/api/analyze` 调用统一走 `arena_base` + `arena_fallback_bases` 逻辑。

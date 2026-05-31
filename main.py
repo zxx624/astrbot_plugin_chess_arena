@@ -31,6 +31,9 @@ class ArenaState:
 class ChessArenaPlugin(Star):
     """AstrBot 棋擂台客户端：自动注册、SSE 接入、自动接挑战、合法走法和台词。"""
 
+    STARTUP_RETRY_SECONDS = 30
+    MAX_STARTUP_RETRY_SECONDS = 300
+
     def __init__(self, context: Context, config: dict | None = None):
         super().__init__(context)
         self.config = config or {}
@@ -60,6 +63,7 @@ class ChessArenaPlugin(Star):
         self._session: aiohttp.ClientSession | None = None
         self._sse_task: asyncio.Task | None = None
         self._startup_task: asyncio.Task | None = None
+        self._startup_retry_delay = float(self.STARTUP_RETRY_SECONDS)
         self._stopping = asyncio.Event()
 
         self._startup_task = asyncio.create_task(self._startup(), name="chess_arena_startup")
@@ -68,7 +72,11 @@ class ChessArenaPlugin(Star):
         """启动流程：必要时自动注册，验证 token，上报 Bot 设置，然后连接 SSE。"""
         try:
             if not self.token and self.auto_register:
-                await self._auto_register_bot()
+                register_ok = await self._auto_register_bot_with_retry()
+                if register_ok is False:
+                    logger.warning("[ChessArena] 自动注册失败，稍后重试启动。bot=%s", self.bot_name)
+                    await self._schedule_startup_retry()
+                    return
             elif not self.token:
                 logger.warning("[ChessArena] 未配置 token 且 auto_register=false，SSE 客户端不会连接。")
                 return
@@ -83,13 +91,17 @@ class ChessArenaPlugin(Star):
                 return
 
             await self._patch_bot_settings()
+            self._startup_retry_delay = float(self.STARTUP_RETRY_SECONDS)
+            if self._sse_task and not self._sse_task.done():
+                self._sse_task.cancel()
             self._sse_task = asyncio.create_task(self._sse_loop(), name="chess_arena_sse_loop")
             logger.info("[ChessArena] SSE 客户端已启动: %s bot=%s token=%s", self.arena_base, self.bot_name, self._token_hint(self.token))
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - plugin startup must not crash AstrBot
             self.state.last_error = str(exc)
-            logger.exception("[ChessArena] 启动流程失败: %s", exc)
+            logger.warning("[ChessArena] 启动流程异常，稍后自动重试，不影响 AstrBot 主程序: %s", exc)
+            await self._schedule_startup_retry()
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -156,6 +168,23 @@ class ChessArenaPlugin(Star):
                 logger.warning("[ChessArena] 连接棋擂台失败，将尝试备用地址: %s", last_error)
         raise RuntimeError(f"all arena bases failed for {method} {path}: {last_error}")
 
+    async def _auto_register_bot_with_retry(self) -> bool:
+        """Return True on registered, False on network/server temporary failure."""
+        for attempt in range(3):
+            try:
+                await self._auto_register_bot()
+                return True
+            except Exception as exc:  # noqa: BLE001 - registration failures should not kill plugin startup
+                self.state.last_error = str(exc)
+                logger.warning(
+                    "[ChessArena] 自动注册第 %s/3 次失败，保留配置并继续重试: %s",
+                    attempt + 1,
+                    exc,
+                )
+                if attempt < 2:
+                    await asyncio.sleep(2 * (attempt + 1))
+        return False
+
     async def _auto_register_bot(self) -> None:
         payload = self._bot_settings_payload(include_client=True)
         logger.info("[ChessArena] token 为空，正在自动注册 Bot: %s", self.bot_name)
@@ -215,15 +244,27 @@ class ChessArenaPlugin(Star):
         return last
 
     async def _schedule_startup_retry(self) -> None:
+        if self._stopping.is_set():
+            return
+        current_task = asyncio.current_task()
+        if self._startup_task and self._startup_task is not current_task and not self._startup_task.done():
+            return
+
+        delay = max(1.0, self._startup_retry_delay)
+        self._startup_retry_delay = min(delay * 2, float(self.MAX_STARTUP_RETRY_SECONDS))
+
         async def _retry() -> None:
             try:
-                await asyncio.sleep(30)
+                logger.warning("[ChessArena] 将在 %.0f 秒后重试启动。", delay)
+                await asyncio.sleep(delay)
                 if not self._stopping.is_set():
                     await self._startup()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001
-                logger.warning("[ChessArena] 启动重试失败: %s", exc)
+                self.state.last_error = str(exc)
+                logger.warning("[ChessArena] 启动重试异常，将继续排队重试: %s", exc)
+                await self._schedule_startup_retry()
 
         self._startup_task = asyncio.create_task(_retry(), name="chess_arena_startup_retry")
 
@@ -501,23 +542,23 @@ class ChessArenaPlugin(Star):
         payload = {"fen": fen, "depth": depth}
         try:
             timeout = aiohttp.ClientTimeout(total=3)
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.post(
-                    f"{self.arena_base}/api/analyze",
-                    json=payload,
-                    headers=self._auth_headers(),
-                ) as resp:
-                    if resp.status >= 400:
-                        text = await resp.text()
-                        logger.warning("[ChessArena] xqwlight analyze failed: HTTP %s %s", resp.status, text[:100])
-                        return random.choice(legal_moves)
-                    data = await resp.json()
-                    best = str(data.get("best_move") or "").strip()
-                    if best and best in legal_moves:
-                        logger.info("[ChessArena] xqwlight chose: %s", best)
-                        return best
-                    logger.warning("[ChessArena] xqwlight returned unknown move %s, falling back to random", best)
-                    return random.choice(legal_moves)
+            _base, status, text = await self._request_text_with_fallback(
+                "POST",
+                "/api/analyze",
+                json_payload=payload,
+                headers=self._auth_headers(),
+                timeout=timeout,
+            )
+            if status >= 400:
+                logger.warning("[ChessArena] xqwlight analyze failed: HTTP %s %s", status, text[:100])
+                return random.choice(legal_moves)
+            data = json.loads(text) if text else {}
+            best = str(data.get("best_move") or "").strip()
+            if best and best in legal_moves:
+                logger.info("[ChessArena] xqwlight chose: %s", best)
+                return best
+            logger.warning("[ChessArena] xqwlight returned unknown move %s, falling back to random", best)
+            return random.choice(legal_moves)
         except (asyncio.TimeoutError, aiohttp.ClientError, Exception) as exc:
             logger.warning("[ChessArena] xqwlight engine error, falling back to random: %s", exc)
             return random.choice(legal_moves)
