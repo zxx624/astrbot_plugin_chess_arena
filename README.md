@@ -7,7 +7,7 @@ AstrBot 棋擂台 Arena 客户端插件 — 连接楚河 Bot 棋擂台平台，�
 - **自动注册**：Token 为空时自动向平台注册 Bot 并写回配置
 - **SSE 接入**：实时接收挑战、轮次等事件
 - **自动接挑战**：收到挑战自动接受
-- **合法走棋**：始终从平台下发的合法走法中选择，按棋风偏好
+- **合法走棋**：始终从平台下发的合法走法中选择，可选随机或 xqwlight 象棋引擎
 - **LLM 台词**：走棋时调用 AstrBot 当前 LLM 生成拟人台词，失败有模板兜底
 - **WebUI 配置**：所有参数均可在 AstrBot 插件配置页面修改
 
@@ -33,7 +33,8 @@ AstrBot 棋擂台 Arena 客户端插件 — 连接楚河 Bot 棋擂台平台，�
 | `commentary_enabled` | 是否生成台词 | `true` |
 | `commentary_timeout_sec` | 台词超时秒数 | `8` |
 | `auto_accept_challenges` | 自动接挑战 | `true` |
-| `engine_mode` | 引擎模式 | `random` |
+| `engine_mode` | 走棋模式：`random` 随机 / `xqwlight` 象棋引擎 | `xqwlight` |
+| `engine_depth` | xqwlight 搜索深度（1-6，越大越慢） | `3` |
 | `move_timeout_sec` | 走法提交超时 | `10` |
 | `announce_to_current_chat` | 向当前聊天播报（预留） | `false` |
 
@@ -45,16 +46,14 @@ AstrBot 棋擂台 Arena 客户端插件 — 连接楚河 Bot 棋擂台平台，�
 | `棋擂台在线` | 主动检查平台 HTTP 可达性 |
 | `棋擂台挑战 <bot_id>` | 向指定 Bot 发起挑战 |
 
-## 棋风说明
+## 走棋模式说明
 
-| 棋风 | 行为 |
+| `engine_mode` | 行为 |
 |------|------|
-| `random` | 随机选步 |
-| `aggressive` | 偏好靠后的走法（激进） |
-| `steady` | 取中间走法（稳健） |
-| `defensive` | 同 steady |
-| `greedy` | 偏好靠后的走法（贪心） |
-| `showman` | 同 aggressive |
+| `random` | 随机从平台下发的合法走法中选一步 |
+| `xqwlight` | 调用棋擂台平台 `/api/analyze` 象棋引擎选步；若接口异常或返回非法走法，会自动回退随机合法走法 |
+
+`chess_style` 现在只用于 Bot 展示和台词风格，不再作为引擎模式选项。
 
 ## 平台配合
 
@@ -64,6 +63,8 @@ AstrBot 棋擂台 Arena 客户端插件 — 连接楚河 Bot 棋擂台平台，�
 
 ## 版本历史
 
+- **3.0.4** — WebUI 走棋模式改为 `random` / `xqwlight` 二选一，默认启用 xqwlight，并暴露 `engine_depth`
+- **3.0.3** — 移除公开版公网 IP 默认兜底
 - **3.0.0** — 首个正式发布版本：完整 SSE 接入、LLM 台词、WebUI 全配置、QQ 命令
 
 

@@ -69,10 +69,20 @@
     "default": true
   },
   "engine_mode": {
-    "description": "引擎模式",
+    "description": "走棋模式",
     "type": "string",
-    "hint": "V0.2 支持 random/style：始终只从平台下发 legal_moves 中选择合法走法",
-    "default": "random"
+    "hint": "可选 random 或 xqwlight。random=随机从平台下发的合法走法中选一步；xqwlight=调用棋擂台平台 /api/analyze 象棋引擎选步，失败时回退 random。",
+    "default": "xqwlight",
+    "options": [
+      "random",
+      "xqwlight"
+    ]
+  },
+  "engine_depth": {
+    "description": "xqwlight 搜索深度",
+    "type": "int",
+    "hint": "仅 engine_mode=xqwlight 时生效；建议 1-6，越大越慢。",
+    "default": 3
   },
   "move_timeout_sec": {
     "description": "走法提交超时秒数",
