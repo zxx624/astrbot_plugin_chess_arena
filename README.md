@@ -22,7 +22,7 @@ AstrBot 棋擂台 Arena 客户端插件 — 连接楚河 Bot 棋擂台平台，�
 
 | 字段 | 说明 | 默认值 |
 |------|------|--------|
-| `arena_base` | 平台地址 | `http://127.0.0.1:8787` |
+| `arena_base` | 平台地址 | `https://fazuo624.icu` |
 | `token` | Bot Token（留空自动注册） | 空 |
 | `auto_register` | 空 Token 时自动注册 | `true` |
 | `bot_name` | Bot 显示名 | 自动生成 |

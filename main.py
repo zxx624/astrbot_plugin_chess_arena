@@ -34,10 +34,12 @@ class ChessArenaPlugin(Star):
     def __init__(self, context: Context, config: dict | None = None):
         super().__init__(context)
         self.config = config or {}
-        self.arena_base = str(self.config.get("arena_base") or "http://127.0.0.1:8787").rstrip("/")
+        self.arena_base = str(self.config.get("arena_base") or "https://fazuo624.icu").rstrip("/")
         self.token = str(self.config.get("token") or "").strip()
         self.auto_register = bool(self.config.get("auto_register", True))
-        self.bot_name = str(self.config.get("bot_name") or "").strip() or self._default_bot_name()
+        configured_bot_name = str(self.config.get("bot_name") or "").strip()
+        self._generated_bot_name = not configured_bot_name
+        self.bot_name = configured_bot_name or self._default_bot_name()
         self.avatar_url = str(self.config.get("avatar_url") or "").strip()
         self.description = str(self.config.get("description") or "AstrBot Chess Arena bot").strip()
         self.chess_style = str(self.config.get("chess_style") or "random").strip() or "random"
@@ -49,6 +51,7 @@ class ChessArenaPlugin(Star):
         self.commentary_timeout_sec = int(self.config.get("commentary_timeout_sec") or 8)
         self.auto_accept_challenges = bool(self.config.get("auto_accept_challenges", True))
         self.engine_mode = str(self.config.get("engine_mode") or "random")
+        self.engine_depth = int(self.config.get("engine_depth") or 3)
         self.move_timeout_sec = int(self.config.get("move_timeout_sec") or 10)
         self.announce_to_current_chat = bool(self.config.get("announce_to_current_chat", False))
 
@@ -107,8 +110,11 @@ class ChessArenaPlugin(Star):
             raise RuntimeError(f"register bot response missing token: {self._short(data)}")
         self.token = token
         self.config["token"] = token
+        self.config["arena_base"] = self.arena_base
+        if self._generated_bot_name:
+            self.config["bot_name"] = self.bot_name
         logger.info("[ChessArena] 自动注册成功 bot_id=%s token=%s", data.get("bot_id") or data.get("id"), self._token_hint(token))
-        await self._save_token_to_runtime_config(token)
+        await self._save_registration_to_runtime_config(token)
 
     async def _verify_token(self) -> bool:
         session = await self._get_session()
@@ -150,23 +156,55 @@ class ChessArenaPlugin(Star):
             payload.update({"client_type": "astrbot", "instance_name": self._instance_name()})
         return payload
 
-    async def _save_token_to_runtime_config(self, token: str) -> None:
-        """尽量把自动注册 token 写回 AstrBot 插件 runtime config；失败只提示日志。"""
+    async def _save_registration_to_runtime_config(self, token: str) -> None:
+        """把自动注册结果写回 AstrBot 插件 runtime config，便于打开配置页直接看到 token。"""
         paths = self._candidate_runtime_config_paths()
         if not paths:
             logger.warning("[ChessArena] 未找到 runtime config 路径，无法自动写回 token=%s", self._token_hint(token))
             return
 
         last_error = ""
+        wrote = False
         for path in paths:
-            try:
-                await asyncio.to_thread(self._write_token_config_file, path, token)
-                logger.info("[ChessArena] 已写回 token 到 runtime config: %s token=%s", path, self._token_hint(token))
-                return
-            except Exception as exc:  # noqa: BLE001
-                last_error = f"{path}: {exc}"
-                logger.warning("[ChessArena] 写回 token 到 runtime config 失败: %s", last_error)
-        logger.warning("[ChessArena] token 自动写回失败，请手动复制到 WebUI 配置。最后错误: %s", last_error)
+            # 只写当前实例推导出的 config；避免 astrbot1 新装时误写 astrbot2。
+            if path.exists() or path == self._instance_runtime_config_path():
+                try:
+                    await asyncio.to_thread(self._write_registration_config_file, path, self._runtime_config_payload(token))
+                    logger.info("[ChessArena] 已写回注册信息到 runtime config: %s token=%s", path, self._token_hint(token))
+                    wrote = True
+                except Exception as exc:  # noqa: BLE001
+                    last_error = f"{path}: {exc}"
+                    logger.warning("[ChessArena] 写回注册信息到 runtime config 失败: %s", last_error)
+        if not wrote:
+            logger.warning("[ChessArena] token 自动写回失败，请手动复制到 WebUI 配置。最后错误: %s", last_error)
+
+    def _runtime_config_payload(self, token: str) -> dict[str, Any]:
+        data = dict(self.config)
+        data.update({
+            "arena_base": self.arena_base,
+            "token": token,
+            "auto_register": self.auto_register,
+            "bot_name": self.bot_name,
+            "avatar_url": self.avatar_url,
+            "description": self.description,
+            "chess_style": self.chess_style,
+            "persona_prompt": self.persona_prompt,
+            "commentary_enabled": self.commentary_enabled,
+            "commentary_timeout_sec": self.commentary_timeout_sec,
+            "auto_accept_challenges": self.auto_accept_challenges,
+            "engine_mode": self.engine_mode,
+            "engine_depth": self.engine_depth,
+            "move_timeout_sec": self.move_timeout_sec,
+            "announce_to_current_chat": self.announce_to_current_chat,
+        })
+        return data
+
+    def _instance_runtime_config_path(self) -> Path:
+        here = Path(__file__).resolve()
+        for parent in here.parents:
+            if parent.name == "plugins" and parent.parent.name == "data":
+                return parent.parent / "config" / "astrbot_plugin_chess_arena_config.json"
+        return here.parent / "astrbot_plugin_chess_arena_config.json"
 
     def _candidate_runtime_config_paths(self) -> list[Path]:
         env_path = os.environ.get("CHESS_ARENA_CONFIG_PATH") or os.environ.get("ASTRBOT_PLUGIN_CHESS_ARENA_CONFIG")
@@ -196,7 +234,7 @@ class ChessArenaPlugin(Star):
         return sorted(deduped, key=lambda p: (not p.exists(), str(p)))
 
     @staticmethod
-    def _write_token_config_file(path: Path, token: str) -> None:
+    def _write_registration_config_file(path: Path, values: dict[str, Any]) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         data: dict[str, Any] = {}
         if path.exists():
@@ -204,7 +242,7 @@ class ChessArenaPlugin(Star):
             data = json.loads(raw) if raw else {}
             if not isinstance(data, dict):
                 raise ValueError("config root is not object")
-        data["token"] = token
+        data.update(values)
         tmp = path.with_suffix(path.suffix + ".tmp")
         tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         tmp.replace(path)
@@ -297,7 +335,7 @@ class ChessArenaPlugin(Star):
         if not isinstance(legal_moves, list) or not legal_moves:
             logger.warning("[ChessArena] your_turn 无 legal_moves: %s", event)
             return
-        move = self._choose_move(legal_moves, event)
+        move = await self._choose_move(legal_moves, event)
         match_id = event.get("match_id") or event.get("matchId") or event.get("id")
         if not match_id:
             logger.warning("[ChessArena] your_turn 缺少 match_id: %s", event)
@@ -321,12 +359,15 @@ class ChessArenaPlugin(Star):
             self.state.submitted_moves += 1
             logger.info("[ChessArena] match=%s 已提交走法: %s comment=%s", match_id, move, comment)
 
-    def _choose_move(self, legal_moves: list[Any], event: dict[str, Any]) -> str:
-        """始终从后端给出的 legal_moves 中选步；按 chess_style 做轻量偏好。"""
+    async def _choose_move(self, legal_moves: list[Any], event: dict[str, Any]) -> str:
+        """始终从后端给出的 legal_moves 中选步；按 engine_mode 选策略。"""
         moves = [str(move) for move in legal_moves if move]
         if not moves:
             raise RuntimeError("no legal moves")
-        style = (self.chess_style or self.engine_mode or "random").lower()
+        mode = (self.engine_mode or "random").lower()
+        if mode == "xqwlight":
+            return await self._choose_xqwlight_move(moves, event)
+        style = mode
         if style in {"steady", "defensive"}:
             return sorted(moves)[len(moves) // 2]
         if style in {"aggressive", "greedy", "showman"}:
@@ -334,6 +375,37 @@ class ChessArenaPlugin(Star):
             pool = ranked[max(0, len(ranked) * 2 // 3):] or ranked
             return random.choice(pool)
         return random.choice(moves)
+
+    async def _choose_xqwlight_move(self, legal_moves: list[str], event: dict[str, Any]) -> str:
+        """Call xqwlight engine via arena API; fall back to random on any error."""
+        fen = event.get("fen") or ""
+        if not fen:
+            logger.warning("[ChessArena] xqwlight mode but no FEN in event, falling back to random")
+            return random.choice(legal_moves)
+        depth = max(1, self.engine_depth)
+        payload = {"fen": fen, "depth": depth}
+        try:
+            timeout = aiohttp.ClientTimeout(total=3)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(
+                    f"{self.arena_base}/api/analyze",
+                    json=payload,
+                    headers=self._auth_headers(),
+                ) as resp:
+                    if resp.status >= 400:
+                        text = await resp.text()
+                        logger.warning("[ChessArena] xqwlight analyze failed: HTTP %s %s", resp.status, text[:100])
+                        return random.choice(legal_moves)
+                    data = await resp.json()
+                    best = str(data.get("best_move") or "").strip()
+                    if best and best in legal_moves:
+                        logger.info("[ChessArena] xqwlight chose: %s", best)
+                        return best
+                    logger.warning("[ChessArena] xqwlight returned unknown move %s, falling back to random", best)
+                    return random.choice(legal_moves)
+        except (asyncio.TimeoutError, aiohttp.ClientError, Exception) as exc:
+            logger.warning("[ChessArena] xqwlight engine error, falling back to random: %s", exc)
+            return random.choice(legal_moves)
 
     async def _make_comment(self, move: str, event: dict[str, Any]) -> str:
         if not self.commentary_enabled:
@@ -454,7 +526,7 @@ class ChessArenaPlugin(Star):
             yield event.plain_result(f"发起挑战异常：{exc}")
 
     def _auth_headers(self) -> dict[str, str]:
-        return {"Authorization": f"Bearer {self.token}"}
+        return {"Authorization": f"Bearer {self.token}", "X-Bot-Token": self.token}
 
     @staticmethod
     def _safe_url(url: str) -> str:
@@ -478,7 +550,7 @@ class ChessArenaPlugin(Star):
 
     @staticmethod
     def _default_bot_name() -> str:
-        return f"AstrBot-{socket.gethostname()[:12] or 'bot'}"
+        return f"AstrBot-{socket.gethostname()[:8] or 'bot'}-{random.randint(1000, 9999)}"
 
     @staticmethod
     def _instance_name() -> str:

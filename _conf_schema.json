@@ -3,7 +3,7 @@
     "description": "棋擂台平台地址",
     "type": "string",
     "hint": "平台 HTTP/SSE Base URL，不要以 / 结尾",
-    "default": "http://127.0.0.1:8787"
+    "default": "https://fazuo624.icu"
   },
   "token": {
     "description": "Bot 接入 Token，留空则自动注册；也可在 WebUI 手动修改",
