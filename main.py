@@ -51,7 +51,7 @@ class ChessArenaPlugin(Star):
         self.commentary_enabled = bool(self.config.get("commentary_enabled", True))
         self.commentary_timeout_sec = int(self.config.get("commentary_timeout_sec") or 8)
         self.auto_accept_challenges = bool(self.config.get("auto_accept_challenges", True))
-        self.engine_mode = str(self.config.get("engine_mode") or "random")
+        self.engine_mode = str(self.config.get("engine_mode") or "xqwlight")
         self.engine_depth = int(self.config.get("engine_depth") or 3)
         self.move_timeout_sec = int(self.config.get("move_timeout_sec") or 10)
         self.announce_to_current_chat = bool(self.config.get("announce_to_current_chat", False))
@@ -73,8 +73,13 @@ class ChessArenaPlugin(Star):
                 logger.warning("[ChessArena] 未配置 token 且 auto_register=false，SSE 客户端不会连接。")
                 return
 
-            if not await self._verify_token():
-                logger.warning("[ChessArena] token 无效或验证失败，请在 WebUI 检查配置。token=%s", self._token_hint(self.token))
+            verify_ok = await self._verify_token_with_retry()
+            if verify_ok is False:
+                logger.warning("[ChessArena] token 无效，请在 WebUI 检查配置。token=%s", self._token_hint(self.token))
+                return
+            if verify_ok is None:
+                logger.warning("[ChessArena] 暂时无法连接棋擂台，保留 token 并稍后重试启动。token=%s", self._token_hint(self.token))
+                await self._schedule_startup_retry()
                 return
 
             await self._patch_bot_settings()
@@ -178,7 +183,8 @@ class ChessArenaPlugin(Star):
         logger.info("[ChessArena] 自动注册成功 bot_id=%s token=%s", data.get("bot_id") or data.get("id"), self._token_hint(token))
         await self._save_registration_to_runtime_config(token)
 
-    async def _verify_token(self) -> bool:
+    async def _verify_token(self) -> bool | None:
+        """Return True for valid token, False for auth failure, None for network/server failure."""
         try:
             _base, status, text = await self._request_text_with_fallback(
                 "GET",
@@ -186,14 +192,40 @@ class ChessArenaPlugin(Star):
                 headers=self._auth_headers(),
                 timeout=aiohttp.ClientTimeout(total=10),
             )
-            if status >= 400:
+            if status in {401, 403, 404}:
                 logger.warning("[ChessArena] token 验证失败: HTTP %s %s", status, text[:200])
                 return False
+            if status >= 400:
+                logger.warning("[ChessArena] token 验证遇到服务端/临时错误: HTTP %s %s", status, text[:200])
+                return None
             logger.info("[ChessArena] token 验证成功: %s", self._short(json.loads(text) if text else {}))
             return True
         except Exception as exc:  # noqa: BLE001
-            logger.warning("[ChessArena] token 验证异常: %s", exc)
-            return False
+            logger.warning("[ChessArena] token 验证网络异常，稍后重试，不判定 token 无效: %s", exc)
+            return None
+
+    async def _verify_token_with_retry(self) -> bool | None:
+        last: bool | None = None
+        for attempt in range(3):
+            last = await self._verify_token()
+            if last is not None:
+                return last
+            if attempt < 2:
+                await asyncio.sleep(2 * (attempt + 1))
+        return last
+
+    async def _schedule_startup_retry(self) -> None:
+        async def _retry() -> None:
+            try:
+                await asyncio.sleep(30)
+                if not self._stopping.is_set():
+                    await self._startup()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[ChessArena] 启动重试失败: %s", exc)
+
+        self._startup_task = asyncio.create_task(_retry(), name="chess_arena_startup_retry")
 
     async def _patch_bot_settings(self) -> None:
         payload = self._bot_settings_payload(include_client=False)
@@ -306,7 +338,7 @@ class ChessArenaPlugin(Star):
         path.parent.mkdir(parents=True, exist_ok=True)
         data: dict[str, Any] = {}
         if path.exists():
-            raw = path.read_text(encoding="utf-8").strip()
+            raw = path.read_text(encoding="utf-8-sig").strip()
             data = json.loads(raw) if raw else {}
             if not isinstance(data, dict):
                 raise ValueError("config root is not object")
@@ -598,15 +630,18 @@ class ChessArenaPlugin(Star):
             yield event.plain_result("用法：棋擂台挑战 <bot_id>")
             return
         try:
-            session = await self._get_session()
-            url = f"{self.arena_base}/api/challenges"
             payload = {"opponent_bot_id": bot_id, "side": "random"}
-            async with session.post(url, json=payload, headers=self._auth_headers(), timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                text = await resp.text()
-                if resp.status >= 400:
-                    yield event.plain_result(f"发起挑战失败：HTTP {resp.status} {text[:200]}")
-                else:
-                    yield event.plain_result(f"已发起挑战 {bot_id}：{text[:300]}")
+            base, status, text = await self._request_text_with_fallback(
+                "POST",
+                "/api/challenges",
+                json_payload=payload,
+                headers=self._auth_headers(),
+                timeout=aiohttp.ClientTimeout(total=10),
+            )
+            if status >= 400:
+                yield event.plain_result(f"发起挑战失败：{base} HTTP {status} {text[:200]}")
+            else:
+                yield event.plain_result(f"已发起挑战 {bot_id}：{text[:300]}")
         except Exception as exc:  # noqa: BLE001
             yield event.plain_result(f"发起挑战异常：{exc}")
 

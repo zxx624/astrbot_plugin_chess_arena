@@ -71,3 +71,11 @@ AstrBot 棋擂台 Arena 客户端插件 — 连接楚河 Bot 棋擂台平台，�
 ## 网络兜底
 
 如果某些 Windows/云服务器网络访问 `https://fazuo624.icu:443` 报 `Connection reset by peer` / `WinError 64 指定的网络名不再可用`，插件会自动尝试你手动配置的 `arena_fallback_bases`。默认留空，不在公开插件里暴露服务器 IP。注册成功后会把实际可用地址写回配置。
+
+
+## v3.0.5
+
+- token 验证遇到网络/域名临时失败时不再误报 token 无效，会保留 token 并自动重试。
+- 代码默认走棋模式与 schema 保持一致：`xqwlight`。
+- runtime config 写回兼容 UTF-8 BOM。
+- `棋擂台挑战` 命令也走备用地址逻辑。
