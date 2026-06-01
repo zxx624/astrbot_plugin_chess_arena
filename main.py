@@ -6,6 +6,8 @@ import json
 import os
 import socket
 import random
+import shlex
+import shutil
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -31,9 +33,6 @@ class ArenaState:
 class ChessArenaPlugin(Star):
     """AstrBot 棋擂台客户端：自动注册、SSE 接入、自动接挑战、合法走法和台词。"""
 
-    STARTUP_RETRY_SECONDS = 30
-    MAX_STARTUP_RETRY_SECONDS = 300
-
     def __init__(self, context: Context, config: dict | None = None):
         super().__init__(context)
         self.config = config or {}
@@ -53,9 +52,18 @@ class ChessArenaPlugin(Star):
         ).strip()
         self.commentary_enabled = bool(self.config.get("commentary_enabled", True))
         self.commentary_timeout_sec = int(self.config.get("commentary_timeout_sec") or 8)
+        self.llm_provider_mode = str(self.config.get("llm_provider_mode") or "default").strip().lower()
+        if self.llm_provider_mode not in {"default", "custom"}:
+            self.llm_provider_mode = "default"
+        self.llm_provider_id = str(self.config.get("llm_provider_id") or "").strip()
         self.auto_accept_challenges = bool(self.config.get("auto_accept_challenges", True))
-        self.engine_mode = str(self.config.get("engine_mode") or "xqwlight")
+        self.engine_mode = self._normalize_engine_mode(self.config.get("engine_mode") or "auto")
         self.engine_depth = int(self.config.get("engine_depth") or 3)
+        self.engine_timeout_sec = max(1, int(self.config.get("engine_timeout_sec") or 8))
+        self.custom_engine_command = str(self.config.get("custom_engine_command") or "").strip()
+        self.custom_engine_http_url = str(self.config.get("custom_engine_http_url") or "").strip()
+        self.custom_engine_http_headers = self.config.get("custom_engine_http_headers") or ""
+        self.local_engine_node_path = str(self.config.get("local_engine_node_path") or "node").strip() or "node"
         self.move_timeout_sec = int(self.config.get("move_timeout_sec") or 10)
         self.announce_to_current_chat = bool(self.config.get("announce_to_current_chat", False))
 
@@ -63,7 +71,6 @@ class ChessArenaPlugin(Star):
         self._session: aiohttp.ClientSession | None = None
         self._sse_task: asyncio.Task | None = None
         self._startup_task: asyncio.Task | None = None
-        self._startup_retry_delay = float(self.STARTUP_RETRY_SECONDS)
         self._stopping = asyncio.Event()
 
         self._startup_task = asyncio.create_task(self._startup(), name="chess_arena_startup")
@@ -72,11 +79,7 @@ class ChessArenaPlugin(Star):
         """启动流程：必要时自动注册，验证 token，上报 Bot 设置，然后连接 SSE。"""
         try:
             if not self.token and self.auto_register:
-                register_ok = await self._auto_register_bot_with_retry()
-                if register_ok is False:
-                    logger.warning("[ChessArena] 自动注册失败，稍后重试启动。bot=%s", self.bot_name)
-                    await self._schedule_startup_retry()
-                    return
+                await self._auto_register_bot()
             elif not self.token:
                 logger.warning("[ChessArena] 未配置 token 且 auto_register=false，SSE 客户端不会连接。")
                 return
@@ -91,17 +94,13 @@ class ChessArenaPlugin(Star):
                 return
 
             await self._patch_bot_settings()
-            self._startup_retry_delay = float(self.STARTUP_RETRY_SECONDS)
-            if self._sse_task and not self._sse_task.done():
-                self._sse_task.cancel()
             self._sse_task = asyncio.create_task(self._sse_loop(), name="chess_arena_sse_loop")
             logger.info("[ChessArena] SSE 客户端已启动: %s bot=%s token=%s", self.arena_base, self.bot_name, self._token_hint(self.token))
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - plugin startup must not crash AstrBot
             self.state.last_error = str(exc)
-            logger.warning("[ChessArena] 启动流程异常，稍后自动重试，不影响 AstrBot 主程序: %s", exc)
-            await self._schedule_startup_retry()
+            logger.exception("[ChessArena] 启动流程失败: %s", exc)
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -168,23 +167,6 @@ class ChessArenaPlugin(Star):
                 logger.warning("[ChessArena] 连接棋擂台失败，将尝试备用地址: %s", last_error)
         raise RuntimeError(f"all arena bases failed for {method} {path}: {last_error}")
 
-    async def _auto_register_bot_with_retry(self) -> bool:
-        """Return True on registered, False on network/server temporary failure."""
-        for attempt in range(3):
-            try:
-                await self._auto_register_bot()
-                return True
-            except Exception as exc:  # noqa: BLE001 - registration failures should not kill plugin startup
-                self.state.last_error = str(exc)
-                logger.warning(
-                    "[ChessArena] 自动注册第 %s/3 次失败，保留配置并继续重试: %s",
-                    attempt + 1,
-                    exc,
-                )
-                if attempt < 2:
-                    await asyncio.sleep(2 * (attempt + 1))
-        return False
-
     async def _auto_register_bot(self) -> None:
         payload = self._bot_settings_payload(include_client=True)
         logger.info("[ChessArena] token 为空，正在自动注册 Bot: %s", self.bot_name)
@@ -244,27 +226,15 @@ class ChessArenaPlugin(Star):
         return last
 
     async def _schedule_startup_retry(self) -> None:
-        if self._stopping.is_set():
-            return
-        current_task = asyncio.current_task()
-        if self._startup_task and self._startup_task is not current_task and not self._startup_task.done():
-            return
-
-        delay = max(1.0, self._startup_retry_delay)
-        self._startup_retry_delay = min(delay * 2, float(self.MAX_STARTUP_RETRY_SECONDS))
-
         async def _retry() -> None:
             try:
-                logger.warning("[ChessArena] 将在 %.0f 秒后重试启动。", delay)
-                await asyncio.sleep(delay)
+                await asyncio.sleep(30)
                 if not self._stopping.is_set():
                     await self._startup()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001
-                self.state.last_error = str(exc)
-                logger.warning("[ChessArena] 启动重试异常，将继续排队重试: %s", exc)
-                await self._schedule_startup_retry()
+                logger.warning("[ChessArena] 启动重试失败: %s", exc)
 
         self._startup_task = asyncio.create_task(_retry(), name="chess_arena_startup_retry")
 
@@ -332,9 +302,16 @@ class ChessArenaPlugin(Star):
             "persona_prompt": self.persona_prompt,
             "commentary_enabled": self.commentary_enabled,
             "commentary_timeout_sec": self.commentary_timeout_sec,
+            "llm_provider_mode": self.llm_provider_mode,
+            "llm_provider_id": self.llm_provider_id,
             "auto_accept_challenges": self.auto_accept_challenges,
             "engine_mode": self.engine_mode,
             "engine_depth": self.engine_depth,
+            "engine_timeout_sec": self.engine_timeout_sec,
+            "custom_engine_command": self.custom_engine_command,
+            "custom_engine_http_url": self.custom_engine_http_url,
+            "custom_engine_http_headers": self.custom_engine_http_headers,
+            "local_engine_node_path": self.local_engine_node_path,
             "move_timeout_sec": self.move_timeout_sec,
             "announce_to_current_chat": self.announce_to_current_chat,
         })
@@ -516,52 +493,209 @@ class ChessArenaPlugin(Star):
             logger.info("[ChessArena] match=%s 已提交走法: %s comment=%s", match_id, move, comment)
 
     async def _choose_move(self, legal_moves: list[Any], event: dict[str, Any]) -> str:
-        """始终从后端给出的 legal_moves 中选步；按 engine_mode 选策略。"""
-        moves = [str(move) for move in legal_moves if move]
+        """始终从后端给出的 legal_moves 中选步；按 engine_mode 走引擎链，最终随机兜底。"""
+        moves = [str(move).strip() for move in legal_moves if str(move or "").strip()]
         if not moves:
             raise RuntimeError("no legal moves")
-        mode = (self.engine_mode or "random").lower()
-        if mode == "xqwlight":
-            return await self._choose_xqwlight_move(moves, event)
-        style = mode
-        if style in {"steady", "defensive"}:
-            return sorted(moves)[len(moves) // 2]
-        if style in {"aggressive", "greedy", "showman"}:
-            ranked = sorted(moves)
-            pool = ranked[max(0, len(ranked) * 2 // 3):] or ranked
-            return random.choice(pool)
-        return random.choice(moves)
+        return await self._run_engine_chain(moves, event)
+
+    def _engine_request_payload(self, legal_moves: list[str], event: dict[str, Any]) -> dict[str, Any]:
+        side = str(event.get("side") or event.get("turn") or "").strip()
+        return {
+            "fen": str(event.get("fen") or "").strip(),
+            "legal_moves": legal_moves,
+            "side": side,
+            "depth": max(1, self.engine_depth),
+            "timeout_ms": self.engine_timeout_sec * 1000,
+            "bot_name": self.bot_name,
+            "chess_style": self.chess_style,
+        }
+
+    @staticmethod
+    def _normalize_engine_mode(mode: Any) -> str:
+        value = str(mode or "auto").strip().lower()
+        if value == "xqwlight":  # 兼容旧配置：旧 xqwlight 等价于服务器 xqwlight
+            return "server_xqwlight"
+        allowed = {"auto", "server_xqwlight", "local_xqwlight", "custom_command", "custom_http", "random"}
+        return value if value in allowed else "auto"
+
+    def _engine_chain(self) -> list[str]:
+        mode = self._normalize_engine_mode(self.engine_mode)
+        if mode == "random":
+            return ["random"]
+        if mode != "auto":
+            return [mode, "random"]
+
+        chain: list[str] = []
+        if self.custom_engine_command:
+            chain.append("custom_command")
+        if self.custom_engine_http_url:
+            chain.append("custom_http")
+        chain.extend(["local_xqwlight", "server_xqwlight", "random"])
+        deduped: list[str] = []
+        for engine in chain:
+            if engine not in deduped:
+                deduped.append(engine)
+        return deduped
+
+    async def _run_engine_chain(self, legal_moves: list[str], event: dict[str, Any]) -> str:
+        payload = self._engine_request_payload(legal_moves, event)
+        for engine in self._engine_chain():
+            try:
+                if engine == "random":
+                    return random.choice(legal_moves)
+                if engine == "server_xqwlight":
+                    best = await self._choose_server_xqwlight_move(payload, legal_moves)
+                elif engine == "local_xqwlight":
+                    best = await self._choose_local_xqwlight_move(payload, legal_moves)
+                elif engine == "custom_command":
+                    best = await self._choose_custom_command_move(payload, legal_moves)
+                elif engine == "custom_http":
+                    best = await self._choose_custom_http_move(payload, legal_moves)
+                else:
+                    logger.warning("[ChessArena] 未知 engine_mode=%s，跳过", engine)
+                    continue
+                valid = self._validate_engine_move(best, legal_moves, engine)
+                if valid:
+                    logger.info("[ChessArena] %s chose: %s", engine, valid)
+                    return valid
+            except Exception as exc:  # noqa: BLE001 - 引擎失败不能影响走棋
+                logger.warning("[ChessArena] %s 引擎失败，尝试下一引擎: %s", engine, exc)
+        return random.choice(legal_moves)
+
+    def _validate_engine_move(self, move: Any, legal_moves: list[str], engine: str = "engine") -> str | None:
+        best = str(move or "").strip()
+        if best and best in legal_moves:
+            return best
+        logger.warning("[ChessArena] %s 返回非法/空走法 %s，legal_moves=%s", engine, best, legal_moves[:20])
+        return None
 
     async def _choose_xqwlight_move(self, legal_moves: list[str], event: dict[str, Any]) -> str:
-        """Call xqwlight engine via arena API; fall back to random on any error."""
-        fen = event.get("fen") or ""
-        if not fen:
-            logger.warning("[ChessArena] xqwlight mode but no FEN in event, falling back to random")
-            return random.choice(legal_moves)
-        depth = max(1, self.engine_depth)
-        payload = {"fen": fen, "depth": depth}
+        """兼容旧内部调用：走服务器 xqwlight，失败随机。"""
+        payload = self._engine_request_payload(legal_moves, event)
         try:
-            timeout = aiohttp.ClientTimeout(total=3)
-            _base, status, text = await self._request_text_with_fallback(
-                "POST",
-                "/api/analyze",
-                json_payload=payload,
-                headers=self._auth_headers(),
-                timeout=timeout,
-            )
-            if status >= 400:
-                logger.warning("[ChessArena] xqwlight analyze failed: HTTP %s %s", status, text[:100])
-                return random.choice(legal_moves)
-            data = json.loads(text) if text else {}
-            best = str(data.get("best_move") or "").strip()
-            if best and best in legal_moves:
-                logger.info("[ChessArena] xqwlight chose: %s", best)
-                return best
-            logger.warning("[ChessArena] xqwlight returned unknown move %s, falling back to random", best)
-            return random.choice(legal_moves)
-        except (asyncio.TimeoutError, aiohttp.ClientError, Exception) as exc:
+            best = await self._choose_server_xqwlight_move(payload, legal_moves)
+            return self._validate_engine_move(best, legal_moves, "server_xqwlight") or random.choice(legal_moves)
+        except Exception as exc:  # noqa: BLE001
             logger.warning("[ChessArena] xqwlight engine error, falling back to random: %s", exc)
             return random.choice(legal_moves)
+
+    async def _choose_server_xqwlight_move(self, payload: dict[str, Any], legal_moves: list[str]) -> str | None:
+        """调用棋擂台平台 /api/analyze；只返回已校验前的 best_move，异常交给引擎链处理。"""
+        if not payload.get("fen"):
+            logger.warning("[ChessArena] server_xqwlight skipped: no FEN in event")
+            return None
+        req = {"fen": payload["fen"], "depth": payload["depth"], "legal_moves": legal_moves}
+        base, status, text = await self._request_text_with_fallback(
+            "POST",
+            "/api/analyze",
+            json_payload=req,
+            headers=self._auth_headers(),
+            timeout=aiohttp.ClientTimeout(total=self.engine_timeout_sec),
+        )
+        if status >= 400:
+            logger.warning("[ChessArena] server_xqwlight analyze failed: %s HTTP %s %s", base, status, text[:100])
+            return None
+        try:
+            data = json.loads(text) if text else {}
+        except json.JSONDecodeError:
+            logger.warning("[ChessArena] server_xqwlight returned non-json: %s", text[:100])
+            return None
+        return data.get("best_move") or data.get("move")
+
+    async def _choose_local_xqwlight_move(self, payload: dict[str, Any], legal_moves: list[str]) -> str | None:
+        script = Path(__file__).resolve().parent / "engine" / "analyze.js"
+        if not script.exists():
+            logger.debug("[ChessArena] local_xqwlight skipped: %s not found", script)
+            return None
+        node = self.local_engine_node_path or "node"
+        if os.path.sep not in node and shutil.which(node) is None:
+            logger.debug("[ChessArena] local_xqwlight skipped: node executable not found: %s", node)
+            return None
+        return await self._run_command_engine([node, str(script)], payload, "local_xqwlight")
+
+    async def _choose_custom_command_move(self, payload: dict[str, Any], legal_moves: list[str]) -> str | None:
+        command = self.custom_engine_command
+        if not command:
+            return None
+        payload_text = json.dumps(payload, ensure_ascii=False)
+        if "{fen_json}" in command:
+            parts = shlex.split(command.replace("{fen_json}", shlex.quote(payload_text)))
+        else:
+            parts = shlex.split(command)
+        if not parts:
+            return None
+        return await self._run_command_engine(parts, payload, "custom_command", stdin_json="{fen_json}" not in command)
+
+    async def _run_command_engine(
+        self,
+        args: list[str],
+        payload: dict[str, Any],
+        engine: str,
+        *,
+        stdin_json: bool = True,
+    ) -> str | None:
+        input_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8") if stdin_json else None
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            stdin=asyncio.subprocess.PIPE if stdin_json else asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(input_bytes), timeout=self.engine_timeout_sec)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.communicate()
+            logger.warning("[ChessArena] %s command timeout: %s", engine, args[:2])
+            return None
+        if proc.returncode != 0:
+            logger.warning("[ChessArena] %s command exited %s: %s", engine, proc.returncode, stderr.decode("utf-8", "ignore")[:200])
+            return None
+        text = stdout.decode("utf-8", "ignore").strip()
+        try:
+            data = json.loads(text) if text else {}
+        except json.JSONDecodeError:
+            logger.warning("[ChessArena] %s command returned non-json: %s", engine, text[:200])
+            return None
+        return data.get("best_move") or data.get("move")
+
+    async def _choose_custom_http_move(self, payload: dict[str, Any], legal_moves: list[str]) -> str | None:
+        url = self.custom_engine_http_url
+        if not url:
+            return None
+        headers = self._custom_engine_headers()
+        session = await self._get_session()
+        async with session.post(
+            url,
+            json=payload,
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=self.engine_timeout_sec),
+        ) as resp:
+            text = await resp.text()
+            if resp.status >= 400:
+                logger.warning("[ChessArena] custom_http failed: HTTP %s %s", resp.status, text[:100])
+                return None
+            try:
+                data = json.loads(text) if text else {}
+            except json.JSONDecodeError:
+                logger.warning("[ChessArena] custom_http returned non-json: %s", text[:200])
+                return None
+        return data.get("best_move") or data.get("move")
+
+    def _custom_engine_headers(self) -> dict[str, str]:
+        raw = self.custom_engine_http_headers
+        if not raw:
+            return {}
+        if isinstance(raw, dict):
+            return {str(k): str(v) for k, v in raw.items()}
+        try:
+            data = json.loads(str(raw))
+            if isinstance(data, dict):
+                return {str(k): str(v) for k, v in data.items()}
+        except json.JSONDecodeError:
+            logger.warning("[ChessArena] custom_engine_http_headers 不是合法 JSON object，已忽略")
+        return {}
 
     async def _make_comment(self, move: str, event: dict[str, Any]) -> str:
         if not self.commentary_enabled:
@@ -571,17 +705,7 @@ class ChessArenaPlugin(Star):
         return self._sanitize_comment(llm_comment or fallback)
 
     async def _try_llm_comment(self, move: str, event: dict[str, Any], fallback: str) -> str:
-        provider = None
-        try:
-            getter = getattr(self.context, "get_using_provider", None)
-            if callable(getter):
-                provider = getter()
-            elif hasattr(self.context, "get_all_providers"):
-                providers = list(self.context.get_all_providers() or [])
-                provider = providers[0] if providers else None
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("[ChessArena] 获取 LLM provider 失败，使用模板台词: %s", exc)
-            return fallback
+        provider = await self._resolve_llm_provider()
         if not provider or not hasattr(provider, "text_chat"):
             return fallback
 
@@ -601,6 +725,43 @@ class ChessArenaPlugin(Star):
         except Exception as exc:  # noqa: BLE001
             logger.debug("[ChessArena] LLM 台词生成失败，使用模板台词: %s", exc)
             return fallback
+
+
+    async def _resolve_llm_provider(self) -> Any:
+        """选择用于台词/非象棋引擎能力的 LLM provider。
+
+        default：跟随 AstrBot 当前默认对话模型。
+        custom：使用配置里的 provider_id；找不到时回退默认对话模型，避免影响走棋。
+        """
+        if self.llm_provider_mode == "custom" and self.llm_provider_id:
+            try:
+                get_by_id = getattr(self.context, "get_provider_by_id", None)
+                if callable(get_by_id):
+                    provider = get_by_id(self.llm_provider_id)
+                    if provider and hasattr(provider, "text_chat"):
+                        return provider
+                    logger.warning(
+                        "[ChessArena] 配置的 LLM provider_id 不可用，将回退默认对话模型: %s",
+                        self.llm_provider_id,
+                    )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[ChessArena] 获取手动指定 LLM provider 失败，将回退默认对话模型: %s", exc)
+
+        try:
+            getter = getattr(self.context, "get_using_provider", None)
+            if callable(getter):
+                provider = getter()
+                if provider and hasattr(provider, "text_chat"):
+                    return provider
+            get_all = getattr(self.context, "get_all_providers", None)
+            if callable(get_all):
+                providers = list(get_all() or [])
+                for provider in providers:
+                    if provider and hasattr(provider, "text_chat"):
+                        return provider
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[ChessArena] 获取默认 LLM provider 失败，使用模板台词: %s", exc)
+        return None
 
     def _template_comment(self, move: str, event: dict[str, Any]) -> str:
         style = (self.chess_style or "random").lower()
@@ -637,8 +798,11 @@ class ChessArenaPlugin(Star):
             f"Bot：{self.bot_name}\n"
             f"Token：{token_status}（{self._token_hint(self.token)}）\n"
             f"引擎/棋风：{self.engine_mode}/{self.chess_style}\n"
+            f"引擎链：{' -> '.join(self._engine_chain())}\n"
+            f"本地Node：{self._local_engine_node_status()}\n"
             f"自动注册/自动接挑战：{self.auto_register}/{self.auto_accept_challenges}\n"
             f"走棋台词：{self.commentary_enabled}\n"
+            f"LLM模型：{self._llm_provider_status()}\n"
             f"已接挑战/已走棋：{self.state.accepted_challenges}/{self.state.submitted_moves}\n"
             f"重连次数：{self.state.reconnect_count}\n"
             f"最近事件：{last_event}"
@@ -646,6 +810,18 @@ class ChessArenaPlugin(Star):
         if self.state.last_error:
             msg += f"\n最近错误：{self.state.last_error}"
         yield event.plain_result(msg)
+
+    def _llm_provider_status(self) -> str:
+        if self.llm_provider_mode == "custom":
+            return f"手动指定({self.llm_provider_id or '未填写，回退默认'})"
+        return "默认对话模型"
+
+    def _local_engine_node_status(self) -> str:
+        script = Path(__file__).resolve().parent / "engine" / "analyze.js"
+        node = self.local_engine_node_path or "node"
+        node_ok = bool(os.path.sep in node or shutil.which(node))
+        script_ok = script.exists()
+        return f"node={'可用' if node_ok else '不可用'} analyze.js={'存在' if script_ok else '缺失'}"
 
     @filter.command("棋擂台在线")
     async def arena_online(self, event: AstrMessageEvent):

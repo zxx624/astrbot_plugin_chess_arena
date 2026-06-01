@@ -62,6 +62,22 @@
     "hint": "若可用 LLM provider，会在此超时内尝试生成；失败则使用本地模板，不影响走棋",
     "default": 8
   },
+  "llm_provider_mode": {
+    "description": "LLM模型选择方式",
+    "type": "string",
+    "hint": "用于生成下棋对话和其它非象棋引擎 LLM 能力。default=使用 AstrBot 当前默认对话模型；custom=使用下面手动填写的 Provider ID。",
+    "default": "default",
+    "options": [
+      "default",
+      "custom"
+    ]
+  },
+  "llm_provider_id": {
+    "description": "手动指定 Provider ID",
+    "type": "string",
+    "hint": "仅当 LLM模型选择方式=custom 时生效。填写 AstrBot 模型/Provider 的 ID；留空或不可用会自动回退默认对话模型。",
+    "default": ""
+  },
   "auto_accept_challenges": {
     "description": "自动接受挑战",
     "type": "bool",
@@ -71,18 +87,53 @@
   "engine_mode": {
     "description": "走棋模式",
     "type": "string",
-    "hint": "可选 random 或 xqwlight。random=随机从平台下发的合法走法中选一步；xqwlight=调用棋擂台平台 /api/analyze 象棋引擎选步，失败时回退 random。",
-    "default": "xqwlight",
+    "hint": "auto=按自定义/本地/服务器/随机顺序回退；server_xqwlight=调用棋擂台 /api/analyze；local_xqwlight=调用本地 engine/analyze.js；custom_command/custom_http=自定义引擎；random=随机。旧 xqwlight 配置兼容为 server_xqwlight。",
+    "default": "auto",
     "options": [
+      "auto",
+      "server_xqwlight",
+      "local_xqwlight",
+      "custom_command",
+      "custom_http",
       "random",
       "xqwlight"
     ]
   },
   "engine_depth": {
-    "description": "xqwlight 搜索深度",
+    "description": "引擎搜索深度",
     "type": "int",
-    "hint": "仅 engine_mode=xqwlight 时生效；建议 1-6，越大越慢。",
+    "hint": "传给 xqwlight/自定义引擎；建议 1-6，越大越慢。",
     "default": 3
+  },
+  "engine_timeout_sec": {
+    "description": "引擎超时秒数",
+    "type": "int",
+    "hint": "本地命令、自定义命令、自定义 HTTP、服务器引擎的单次调用超时；超时会回退下一引擎，不影响走棋。",
+    "default": 8
+  },
+  "custom_engine_command": {
+    "description": "自定义命令行引擎",
+    "type": "string",
+    "hint": "命令需输出 JSON，如 {\"best_move\":\"h2e2\"}。默认从 stdin 读取统一 JSON；也可在命令中使用 {fen_json} 占位符作为参数。",
+    "default": ""
+  },
+  "custom_engine_http_url": {
+    "description": "自定义 HTTP 引擎 URL",
+    "type": "string",
+    "hint": "插件会 POST 统一 JSON 到该 URL，响应需为 {\"best_move\":\"...\"}；返回走法必须在 legal_moves 中。",
+    "default": ""
+  },
+  "custom_engine_http_headers": {
+    "description": "自定义 HTTP 引擎 Headers",
+    "type": "text",
+    "hint": "可选 JSON object，例如 {\"Authorization\":\"Bearer xxx\"}。格式错误会忽略。",
+    "default": ""
+  },
+  "local_engine_node_path": {
+    "description": "本地 xqwlight Node 路径",
+    "type": "string",
+    "hint": "local_xqwlight 调用 engine/analyze.js 时使用的 node 可执行文件路径或命令名。",
+    "default": "node"
   },
   "move_timeout_sec": {
     "description": "走法提交超时秒数",
