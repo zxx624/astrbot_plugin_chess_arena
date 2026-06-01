@@ -63,6 +63,7 @@ class ChessArenaPlugin(Star):
         self.local_engine_node_path = str(self.config.get("local_engine_node_path") or "node").strip() or "node"
         self.move_timeout_sec = int(self.config.get("move_timeout_sec") or 10)
         self.announce_to_current_chat = bool(self.config.get("announce_to_current_chat", False))
+        self.verbose_logging = self._config_bool(self.config.get("verbose_logging"), default=False)
 
         self.state = ArenaState()
         self._session: aiohttp.ClientSession | None = None
@@ -90,9 +91,9 @@ class ChessArenaPlugin(Star):
                 await self._schedule_startup_retry()
                 return
 
-            logger.info("[ChessArena] 已读取网站端 profile；Bot 资料统一由网站管理，插件端不覆盖。")
+            self._routine_log("[ChessArena] 已读取网站端 profile；Bot 资料统一由网站管理，插件端不覆盖。")
             self._sse_task = asyncio.create_task(self._sse_loop(), name="chess_arena_sse_loop")
-            logger.info(
+            self._routine_log(
                 "[ChessArena] SSE 客户端已启动: %s bot=%s token=%s",
                 self.arena_base,
                 self.effective_bot_name,
@@ -153,6 +154,13 @@ class ChessArenaPlugin(Star):
             return False
         return default
 
+    def _routine_log(self, message: str, *args: Any) -> None:
+        """日常运行日志默认走 DEBUG；开启 verbose_logging 后提升到 INFO。"""
+        if self.verbose_logging:
+            logger.info(message, *args)
+        else:
+            logger.debug(message, *args)
+
     async def _request_text_with_fallback(
         self,
         method: str,
@@ -186,7 +194,7 @@ class ChessArenaPlugin(Star):
 
     async def _auto_register_bot(self) -> None:
         payload = self._bot_settings_payload(include_client=True)
-        logger.info("[ChessArena] token 为空，正在自动注册 Bot: %s", self.bot_name)
+        self._routine_log("[ChessArena] token 为空，正在自动注册 Bot: %s", self.bot_name)
         base, status, text = await self._request_text_with_fallback(
             "POST",
             "/api/bots/register",
@@ -208,7 +216,7 @@ class ChessArenaPlugin(Star):
         self.config["arena_base"] = self.arena_base
         if self._generated_bot_name:
             self.config["bot_name"] = self.bot_name
-        logger.info("[ChessArena] 自动注册成功 bot_id=%s token=%s", data.get("bot_id") or data.get("id"), self._token_hint(token))
+        self._routine_log("[ChessArena] 自动注册成功 bot_id=%s token=%s", data.get("bot_id") or data.get("id"), self._token_hint(token))
         await self._save_registration_to_runtime_config(token)
 
     async def _fetch_server_profile(self) -> bool | None:
@@ -238,7 +246,7 @@ class ChessArenaPlugin(Star):
                 logger.warning("[ChessArena] token 验证返回非 JSON，稍后重试: %s", text[:200])
                 return None
             self.server_profile = self._extract_server_profile(data)
-            logger.info("[ChessArena] token 验证成功，已拉取服务端 profile: %s", self._short(self.server_profile))
+            self._routine_log("[ChessArena] token 验证成功，已拉取服务端 profile: %s", self._short(self.server_profile))
             return True
         except Exception as exc:  # noqa: BLE001
             logger.warning("[ChessArena] token 验证网络异常，稍后重试，不判定 token 无效: %s", exc)
@@ -331,7 +339,7 @@ class ChessArenaPlugin(Star):
             if path.exists() or path == self._instance_runtime_config_path():
                 try:
                     await asyncio.to_thread(self._write_registration_config_file, path, self._runtime_config_payload(token))
-                    logger.info("[ChessArena] 已写回注册信息到 runtime config: %s token=%s", path, self._token_hint(token))
+                    self._routine_log("[ChessArena] 已写回注册信息到 runtime config: %s token=%s", path, self._token_hint(token))
                     wrote = True
                 except Exception as exc:  # noqa: BLE001
                     last_error = f"{path}: {exc}"
@@ -360,6 +368,7 @@ class ChessArenaPlugin(Star):
             "local_engine_node_path": self.local_engine_node_path,
             "move_timeout_sec": self.move_timeout_sec,
             "announce_to_current_chat": self.announce_to_current_chat,
+            "verbose_logging": self.verbose_logging,
         })
         return data
 
@@ -436,7 +445,7 @@ class ChessArenaPlugin(Star):
         last_error = ""
         for base in self._candidate_arena_bases():
             url = f"{base}/sse/bot?token={quote(self.token)}"
-            logger.info("[ChessArena] 正在连接 SSE: %s", self._safe_url(url))
+            self._routine_log("[ChessArena] 正在连接 SSE: %s", self._safe_url(url))
             try:
                 async with session.get(url, headers={"Accept": "text/event-stream"}) as resp:
                     if base != self.arena_base:
@@ -454,7 +463,7 @@ class ChessArenaPlugin(Star):
         resp.raise_for_status()
         self.state.connected = True
         self.state.last_error = ""
-        logger.info("[ChessArena] SSE 已连接")
+        self._routine_log("[ChessArena] SSE 已连接")
 
         event_name: str | None = None
         data_lines: list[str] = []
@@ -485,7 +494,7 @@ class ChessArenaPlugin(Star):
             payload = {"raw": data}
 
         event_type = str(payload.get("type") or payload.get("event") or sse_event or "message")
-        logger.info("[ChessArena] 收到事件 %s: %s", event_type, self._short(payload))
+        self._routine_log("[ChessArena] 收到事件 %s: %s", event_type, self._short(payload))
 
         if event_type == "challenge_received":
             await self._handle_challenge_received(payload)
@@ -494,7 +503,7 @@ class ChessArenaPlugin(Star):
 
     async def _handle_challenge_received(self, event: dict[str, Any]) -> None:
         if not self.auto_accept_challenges:
-            logger.info("[ChessArena] 已忽略挑战：auto_accept_challenges=false")
+            self._routine_log("[ChessArena] 已忽略挑战：auto_accept_challenges=false")
             return
         challenge_id = event.get("id") or event.get("challenge_id") or event.get("challengeId")
         if not challenge_id:
@@ -507,7 +516,7 @@ class ChessArenaPlugin(Star):
             if resp.status >= 400:
                 raise RuntimeError(f"accept challenge failed: HTTP {resp.status} {text[:200]}")
             self.state.accepted_challenges += 1
-            logger.info("[ChessArena] 已接受挑战 %s", challenge_id)
+            self._routine_log("[ChessArena] 已接受挑战 %s", challenge_id)
 
     async def _handle_your_turn(self, event: dict[str, Any]) -> None:
         legal_moves = event.get("legal_moves") or event.get("legalMoves") or []
@@ -536,7 +545,7 @@ class ChessArenaPlugin(Star):
             if resp.status >= 400:
                 raise RuntimeError(f"submit move failed: HTTP {resp.status} {text[:200]}")
             self.state.submitted_moves += 1
-            logger.info("[ChessArena] match=%s 已提交走法: %s comment=%s", match_id, move, comment)
+            self._routine_log("[ChessArena] match=%s 已提交走法: %s comment=%s", match_id, move, comment)
 
     async def _choose_move(self, legal_moves: list[Any], event: dict[str, Any]) -> str:
         """始终从后端给出的 legal_moves 中选步；按 engine_mode 走引擎链，最终随机兜底。"""
@@ -603,7 +612,7 @@ class ChessArenaPlugin(Star):
                     continue
                 valid = self._validate_engine_move(best, legal_moves, engine)
                 if valid:
-                    logger.info("[ChessArena] %s chose: %s", engine, valid)
+                    self._routine_log("[ChessArena] %s chose: %s", engine, valid)
                     return valid
             except Exception as exc:  # noqa: BLE001 - 引擎失败不能影响走棋
                 logger.warning("[ChessArena] %s 引擎失败，尝试下一引擎: %s", engine, exc)

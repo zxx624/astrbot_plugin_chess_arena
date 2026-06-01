@@ -41,6 +41,7 @@ AstrBot 插件页只保留运行/连接配置；Bot 名字、头像、简介、�
 | `local_engine_node_path` | 本地 xqwlight Node 可执行文件路径/命令 | `node` |
 | `move_timeout_sec` | 走法提交超时 | `10` |
 | `announce_to_current_chat` | 向当前聊天播报（预留） | `false` |
+| `verbose_logging` | 详细运行日志；默认关闭以减少 SSE/走棋刷屏 | `false` |
 
 ## 配置归属说明
 
@@ -102,6 +103,7 @@ AstrBot 插件页只保留运行/连接配置；Bot 名字、头像、简介、�
 
 ## 版本历史
 
+- **3.2.2** — 新增 `verbose_logging` 开关；默认把 SSE/事件/选步/提交走法等日常日志降为 DEBUG，减少 AstrBot 控制台刷屏
 - **3.2.1** — 精简 AstrBot 配置页，移除首次注册资料/高级兼容字段；Bot 资料统一在棋擂台网站后台管理
 - **3.0.6** — 新增 `auto/server_xqwlight/local_xqwlight/custom_command/custom_http/random` 双引擎/自定义引擎链，兼容旧 `xqwlight`，所有引擎输出校验 `legal_moves`
 - **3.0.4** — WebUI 走棋模式改为 `random` / `xqwlight` 二选一，默认启用 xqwlight，并暴露 `engine_depth`

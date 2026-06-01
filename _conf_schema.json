@@ -113,6 +113,12 @@
     "hint": "POST /api/matches/{match_id}/move 的超时时间",
     "default": 10
   },
+  "verbose_logging": {
+    "description": "输出详细运行日志",
+    "type": "bool",
+    "hint": "默认关闭：SSE连接、收到事件、选步、提交走法等日常日志降为 DEBUG，减少 AstrBot 控制台刷屏；排查问题时再开启。",
+    "default": false
+  },
   "announce_to_current_chat": {
     "description": "向当前聊天播报",
     "type": "bool",
