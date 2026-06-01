@@ -700,30 +700,49 @@ class ChessArenaPlugin(Star):
     async def _make_comment(self, move: str, event: dict[str, Any]) -> str:
         if not self.commentary_enabled:
             return ""
-        fallback = self._template_comment(move, event)
-        llm_comment = await self._try_llm_comment(move, event, fallback)
-        return self._sanitize_comment(llm_comment or fallback)
+        facts = self._analyze_move_facts(move, event)
+        fallback = self._template_comment(move, event, facts)
+        llm_comment = await self._try_llm_comment(move, event, fallback, facts)
+        return self._sanitize_comment(llm_comment or fallback, facts)
 
-    async def _try_llm_comment(self, move: str, event: dict[str, Any], fallback: str) -> str:
+    async def _try_llm_comment(
+        self, move: str, event: dict[str, Any], fallback: str, facts: dict[str, Any]
+    ) -> str:
         provider = await self._resolve_llm_provider()
         if not provider or not hasattr(provider, "text_chat"):
             return fallback
 
+        forbidden = self._comment_forbidden_claims(facts)
+        fact_lines = [
+            f"Bot 名字：{self.bot_name}",
+            f"棋风：{self.chess_style}",
+            f"人格设定：{self.persona_prompt}",
+            f"本步 UCCI：{move}",
+            f"中文走法：{facts.get('notation') or move}",
+            f"移动棋子：{facts.get('piece_name') or '未知'}",
+            f"动作类型：{facts.get('action_label') or '普通调动'}",
+            f"吃子：{'是，吃掉' + facts.get('captured_name', '') if facts.get('is_capture') else '否'}",
+            f"将军：{'是' if facts.get('is_check') else '否'}",
+            f"执棋方：{facts.get('side_label') or event.get('side') or event.get('turn') or '未知'}",
+            f"当前手数 ply：{event.get('ply', '')}",
+        ]
+        if forbidden:
+            fact_lines.append("禁止声称：" + "、".join(forbidden))
         prompt = (
-            f"你是正在下中国象棋的 Bot，名字：{self.bot_name}，棋风：{self.chess_style}。\n"
-            f"人格设定：{self.persona_prompt}\n"
-            f"当前轮到你走，已选定合法走法 {move}，局面 ply={event.get('ply', '')} side={event.get('side', '')}。\n"
-            "请只输出一句 30 字以内的自然短台词，不要解释，不要提 system/prompt，不要说作为 AI。"
+            "你正在给中国象棋 Bot 的刚刚这一步生成一句台词。必须严格贴合下面事实，不能脑补。\n"
+            + "\n".join(fact_lines)
+            + "\n要求：只输出一句中文短台词，30字以内；像群里真人下棋；不要解释棋理；"
+              "不要提 prompt/system/AI；不要说事实里没有的吃子、将军、杀棋、绝杀、优势。"
         )
-        system_prompt = "你只给象棋走棋台词，短、自然、有个性；不得决定或修改走法。"
+        system_prompt = "你只根据给定事实写象棋走棋台词；事实没有写明的战术效果一律不能声称。"
         try:
             response = await asyncio.wait_for(
-                provider.text_chat(prompt=prompt, system_prompt=system_prompt),
+                provider.text_chat(prompt=prompt, system_prompt=system_prompt, contexts=[]),
                 timeout=max(1, self.commentary_timeout_sec),
             )
             return str(getattr(response, "completion_text", response) or "").strip()
         except Exception as exc:  # noqa: BLE001
-            logger.debug("[ChessArena] LLM 台词生成失败，使用模板台词: %s", exc)
+            logger.debug("[ChessArena] LLM 台词生成失败，使用事实模板台词: %s", exc)
             return fallback
 
 
@@ -763,26 +782,179 @@ class ChessArenaPlugin(Star):
             logger.debug("[ChessArena] 获取默认 LLM provider 失败，使用模板台词: %s", exc)
         return None
 
-    def _template_comment(self, move: str, event: dict[str, Any]) -> str:
-        style = (self.chess_style or "random").lower()
-        templates = {
-            "aggressive": ["这步先压上去，别眨眼。", "我先抢个先手，看你怎么接。"],
-            "greedy": ["有便宜不占，那可不行。", "这步看着就有油水。"],
-            "steady": ["不急，先把阵型站稳。", "稳一点，这棋慢慢磨。"],
-            "defensive": ["先补一手，别给你机会。", "把门看住，再找反击。"],
-            "showman": ["来点花活，棋盘上见真章。", "这步有点意思，坐稳了。"],
-            "random": ["先走这步，看看风向。", "这手落下，局面就热闹了。"],
+    def _comment_forbidden_claims(self, facts: dict[str, Any]) -> list[str]:
+        forbidden: list[str] = []
+        if not facts.get("is_capture"):
+            forbidden.extend(["吃子", "白赚", "有便宜", "收子", "兑掉"])
+        if not facts.get("is_check"):
+            forbidden.extend(["将军", "将一手", "杀棋", "绝杀", "要杀"])
+        if facts.get("action_label") in {"后退防守", "横向调整", "普通调动"}:
+            forbidden.extend(["压上去", "冲上去", "强攻"])
+        return forbidden
+
+    def _analyze_move_facts(self, move: str, event: dict[str, Any]) -> dict[str, Any]:
+        board = self._parse_fen_board(str(event.get("fen") or ""))
+        src_file, src_rank, dst_file, dst_rank = self._parse_ucci(move)
+        piece = ""
+        captured = ""
+        if board and src_file is not None and src_rank is not None:
+            src_row = 9 - src_rank
+            src_col = src_file
+            if 0 <= src_row < 10 and 0 <= src_col < 9:
+                piece = board[src_row][src_col] or ""
+        if board and dst_file is not None and dst_rank is not None:
+            dst_row = 9 - dst_rank
+            dst_col = dst_file
+            if 0 <= dst_row < 10 and 0 <= dst_col < 9:
+                captured = board[dst_row][dst_col] or ""
+
+        side = str(event.get("side") or event.get("turn") or "").lower()
+        if not side and piece:
+            side = "red" if piece.isupper() else "black"
+        notation = self._ucci_to_chinese(move, piece)
+        action_label = self._move_action_label(piece, captured, src_rank, dst_rank)
+        return {
+            "move": move,
+            "piece": piece,
+            "piece_name": self._piece_name(piece),
+            "captured": captured,
+            "captured_name": self._piece_name(captured),
+            "is_capture": bool(captured),
+            "is_check": bool(event.get("check") or event.get("is_check") or event.get("gives_check")),
+            "side": side,
+            "side_label": {"red": "红方", "black": "黑方", "r": "红方", "b": "黑方"}.get(side, side),
+            "notation": notation,
+            "action_label": action_label,
         }
-        pool = templates.get(style) or templates["random"]
-        return f"{random.choice(pool)}（{move}）"
 
     @staticmethod
-    def _sanitize_comment(text: str) -> str:
+    def _parse_ucci(move: str) -> tuple[int | None, int | None, int | None, int | None]:
+        move = str(move or "").strip().lower()
+        if len(move) < 4:
+            return None, None, None, None
+        try:
+            return ord(move[0]) - ord("a"), int(move[1]), ord(move[2]) - ord("a"), int(move[3])
+        except Exception:
+            return None, None, None, None
+
+    @staticmethod
+    def _parse_fen_board(fen: str) -> list[list[str]]:
+        placement = str(fen or "").split()[0] if fen else ""
+        rows: list[list[str]] = []
+        for raw_row in placement.split("/")[:10]:
+            row: list[str] = []
+            for ch in raw_row:
+                if ch.isdigit():
+                    row.extend([""] * int(ch))
+                else:
+                    row.append(ch)
+            rows.append((row + [""] * 9)[:9])
+        while len(rows) < 10:
+            rows.append([""] * 9)
+        return rows
+
+    @staticmethod
+    def _piece_name(piece: str) -> str:
+        names = {
+            "K": "帅", "A": "仕", "B": "相", "E": "相", "N": "马", "H": "马", "R": "车", "C": "炮", "P": "兵",
+            "k": "将", "a": "士", "b": "象", "e": "象", "n": "马", "h": "马", "r": "车", "c": "炮", "p": "卒",
+        }
+        return names.get(piece or "", "")
+
+    def _ucci_to_chinese(self, move: str, piece: str = "") -> str:
+        sf, sr, df, dr = self._parse_ucci(move)
+        name = self._piece_name(piece)
+        if sf is None or sr is None or df is None or dr is None or not name:
+            return move
+        is_red = piece.isupper()
+        red_cols = "九八七六五四三二一"
+        black_cols = "123456789"
+        red_nums = "一二三四五六七八九"
+        black_nums = "123456789"
+        if is_red:
+            start_col = red_cols[sf]
+            if df == sf:
+                verb = "进" if dr > sr else "退"
+                target = red_nums[abs(dr - sr) - 1] if abs(dr - sr) else red_nums[dr]
+            else:
+                verb = "平"
+                target = red_cols[df]
+        else:
+            start_col = black_cols[sf]
+            if df == sf:
+                verb = "进" if dr < sr else "退"
+                target = black_nums[abs(dr - sr) - 1] if abs(dr - sr) else black_nums[dr]
+            else:
+                verb = "平"
+                target = black_cols[df]
+        return f"{name}{start_col}{verb}{target}"
+
+    @staticmethod
+    def _move_action_label(piece: str, captured: str, src_rank: int | None, dst_rank: int | None) -> str:
+        if captured:
+            return "吃子"
+        if src_rank is None or dst_rank is None or not piece:
+            return "普通调动"
+        if dst_rank == src_rank:
+            return "横向调整"
+        is_red = piece.isupper()
+        forward = dst_rank > src_rank if is_red else dst_rank < src_rank
+        if forward:
+            return "向前压进"
+        return "后退防守"
+
+    def _template_comment(self, move: str, event: dict[str, Any], facts: dict[str, Any] | None = None) -> str:
+        facts = facts or self._analyze_move_facts(move, event)
+        notation = facts.get("notation") or move
+        if facts.get("is_check") and facts.get("is_capture"):
+            pool = ["吃一口还带将，挺顺。", "这手有点劲，看你怎么应。"]
+        elif facts.get("is_check"):
+            pool = ["将一手，看看你怎么解。", "先给你一点压力。"]
+        elif facts.get("is_capture"):
+            pool = ["这子我先收下。", "有子能吃，不能客气。"]
+        elif facts.get("action_label") == "向前压进":
+            pool = ["先往前压一步。", "这步把位置顶上去。"]
+        elif facts.get("action_label") == "后退防守":
+            pool = ["先回防一下。", "这口我先补住。"]
+        elif facts.get("action_label") == "横向调整":
+            pool = ["先换个位置看你反应。", "这步先调整一下。"]
+        else:
+            pool = ["先走这步，看看你怎么接。", "这手先稳住局面。"]
+        return f"{random.choice(pool)}（{notation}）"
+
+    @staticmethod
+    def _sanitize_comment(text: str, facts: dict[str, Any] | None = None) -> str:
         text = " ".join(str(text or "").replace("\n", " ").split()).strip(' \"“”')
         banned = ("作为AI", "作为 AI", "我是AI", "我是 AI")
         for item in banned:
             text = text.replace(item, "")
+        if facts:
+            blocked: list[str] = []
+            if not facts.get("is_capture"):
+                blocked.extend(["吃", "收下", "白赚", "有便宜"])
+            if not facts.get("is_check"):
+                blocked.extend(["将军", "绝杀", "杀棋"])
+            if any(word in text for word in blocked):
+                return ChessArenaPlugin._template_comment_static(facts)
         return text[:80] if text else "先走这步。"
+
+    @staticmethod
+    def _template_comment_static(facts: dict[str, Any]) -> str:
+        notation = facts.get("notation") or facts.get("move") or "这步"
+        if facts.get("is_check") and facts.get("is_capture"):
+            return f"这手有点劲，看你怎么应。（{notation}）"
+        if facts.get("is_check"):
+            return f"将一手，看看你怎么解。（{notation}）"
+        if facts.get("is_capture"):
+            return f"这子我先收下。（{notation}）"
+        action = facts.get("action_label")
+        if action == "向前压进":
+            return f"先往前压一步。（{notation}）"
+        if action == "后退防守":
+            return f"先回防一下。（{notation}）"
+        if action == "横向调整":
+            return f"这步先调整一下。（{notation}）"
+        return f"先走这步，看看你怎么接。（{notation}）"
 
     @filter.command("棋擂台状态")
     async def arena_status(self, event: AstrMessageEvent):
