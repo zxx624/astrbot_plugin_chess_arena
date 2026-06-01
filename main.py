@@ -505,18 +505,19 @@ class ChessArenaPlugin(Star):
         if not self.auto_accept_challenges:
             self._routine_log("[ChessArena] 已忽略挑战：auto_accept_challenges=false")
             return
-        challenge_id = event.get("id") or event.get("challenge_id") or event.get("challengeId")
+        challenge_id = event.get("challenge_id") or event.get("challengeId") or event.get("id")
         if not challenge_id:
             logger.warning("[ChessArena] challenge_received 缺少 id: %s", event)
             return
-        session = await self._get_session()
-        url = f"{self.arena_base}/api/challenges/{quote(str(challenge_id), safe='')}/accept"
-        async with session.post(url, headers=self._auth_headers()) as resp:
-            text = await resp.text()
-            if resp.status >= 400:
-                raise RuntimeError(f"accept challenge failed: HTTP {resp.status} {text[:200]}")
-            self.state.accepted_challenges += 1
-            self._routine_log("[ChessArena] 已接受挑战 %s", challenge_id)
+        _base, status, text = await self._request_text_with_fallback(
+            "POST",
+            f"/api/challenges/{quote(str(challenge_id), safe='')}/accept",
+            headers=self._auth_headers(),
+        )
+        if status >= 400:
+            raise RuntimeError(f"accept challenge failed: HTTP {status} {text[:200]}")
+        self.state.accepted_challenges += 1
+        self._routine_log("[ChessArena] 已接受挑战 %s", challenge_id)
 
     async def _handle_your_turn(self, event: dict[str, Any]) -> None:
         legal_moves = event.get("legal_moves") or event.get("legalMoves") or []
@@ -532,20 +533,23 @@ class ChessArenaPlugin(Star):
         started = time.perf_counter()
         comment = await self._make_comment(move, event)
         duration_ms = max(1, int((time.perf_counter() - started) * 1000))
-        session = await self._get_session()
-        url = f"{self.arena_base}/api/matches/{quote(str(match_id), safe='')}/move"
         payload = {
             "move": move,
             "comment": comment,
             "duration_ms": duration_ms,
         }
         timeout = aiohttp.ClientTimeout(total=max(1, self.move_timeout_sec))
-        async with session.post(url, json=payload, headers=self._auth_headers(), timeout=timeout) as resp:
-            text = await resp.text()
-            if resp.status >= 400:
-                raise RuntimeError(f"submit move failed: HTTP {resp.status} {text[:200]}")
-            self.state.submitted_moves += 1
-            self._routine_log("[ChessArena] match=%s 已提交走法: %s comment=%s", match_id, move, comment)
+        _base, status, text = await self._request_text_with_fallback(
+            "POST",
+            f"/api/matches/{quote(str(match_id), safe='')}/move",
+            json_payload=payload,
+            headers=self._auth_headers(),
+            timeout=timeout,
+        )
+        if status >= 400:
+            raise RuntimeError(f"submit move failed: HTTP {status} {text[:200]}")
+        self.state.submitted_moves += 1
+        self._routine_log("[ChessArena] match=%s 已提交走法: %s comment=%s", match_id, move, comment)
 
     async def _choose_move(self, legal_moves: list[Any], event: dict[str, Any]) -> str:
         """始终从后端给出的 legal_moves 中选步；按 engine_mode 走引擎链，最终随机兜底。"""

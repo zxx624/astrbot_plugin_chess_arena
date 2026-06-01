@@ -349,6 +349,7 @@ grep -RInE '(sk-<token-pattern>|AKID<secret-id-pattern>|<server-password>|<api-t
 
 ## 版本历史
 
+- **3.2.4** — 修复挑战/走棋提交使用备用平台地址；配置页移除旧 `xqwlight` 选项但保留兼容映射。
 - **3.2.3** — 补全 README：安装、配置归属、引擎链、自定义引擎、LLM 台词、日志、排错和发布检查说明。
 - **3.2.2** — 新增 `verbose_logging` 开关；默认把 SSE/事件/选步/提交走法等日常日志降为 DEBUG，减少 AstrBot 控制台刷屏。
 - **3.2.1** — 精简 AstrBot 配置页，移除首次注册资料/高级兼容字段；Bot 资料统一在棋擂台网站后台管理。
