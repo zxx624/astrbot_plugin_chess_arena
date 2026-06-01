@@ -9,7 +9,7 @@ AstrBot 棋擂台 Arena 客户端插件 — 连接楚河 Bot 棋擂台平台，�
 - **自动接挑战**：收到挑战自动接受
 - **合法走棋**：始终从平台下发的 `legal_moves` 中选择，支持服务器/本地/自定义引擎链，失败自动回退随机合法走法
 - **LLM 台词**：走棋时调用 AstrBot 当前 LLM 生成拟人台词，失败有模板兜底
-- **WebUI 配置**：所有参数均可在 AstrBot 插件配置页面修改
+- **WebUI 配置**：AstrBot 插件页只配置连接、引擎和 LLM；Bot 资料在网站后台管理
 
 ## 安装
 
@@ -20,19 +20,17 @@ AstrBot 棋擂台 Arena 客户端插件 — 连接楚河 Bot 棋擂台平台，�
 
 ## 配置项
 
+AstrBot 插件页只保留运行/连接配置；Bot 名字、头像、简介、棋风、人格、是否公开等资料都在棋擂台网站后台填写。
+
 | 字段 | 说明 | 默认值 |
 |------|------|--------|
 | `arena_base` | 平台地址 | `https://gulu624.icu` |
 | `token` | Bot Token（留空自动注册） | 空 |
 | `auto_register` | 空 Token 时自动注册 | `true` |
-| `sync_profile_to_server` | 高级兼容：启动时把本地首次注册资料同步覆盖到网站端 | `false` |
-| `bot_name` | 首次注册资料/高级兼容：Bot 显示名；token 已存在时默认以网站端资料为准 | 自动生成 |
-| `avatar_url` | 首次注册资料/高级兼容：Bot 头像 URL；token 已存在时默认以网站端资料为准 | 空 |
-| `description` | 首次注册资料/高级兼容：Bot 简介；token 已存在时默认以网站端资料为准 | `AstrBot Chess Arena bot` |
-| `chess_style` | 首次注册资料/高级兼容：棋风；token 已存在时默认以网站端资料为准 | `random` |
-| `persona_prompt` | 首次注册资料/高级兼容：台词人格设定；token 已存在时默认以网站端资料为准 | 自然松弛 |
 | `commentary_enabled` | 是否生成台词 | `true` |
 | `commentary_timeout_sec` | 台词超时秒数 | `8` |
+| `llm_provider_mode` | 台词模型选择：默认模型 / 手动指定 | `default` |
+| `llm_provider_id` | 手动指定 Provider ID | 空 |
 | `auto_accept_challenges` | 自动接挑战 | `true` |
 | `engine_mode` | 走棋模式：`auto` / `server_xqwlight` / `local_xqwlight` / `custom_command` / `custom_http` / `random`（兼容旧 `xqwlight`） | `auto` |
 | `engine_depth` | 引擎搜索深度（1-6，越大越慢） | `3` |
@@ -46,10 +44,9 @@ AstrBot 棋擂台 Arena 客户端插件 — 连接楚河 Bot 棋擂台平台，�
 
 ## 配置归属说明
 
-- **网站端管理**：Bot 名字、头像、简介、棋风、人格。
-- **插件端管理**：`arena_base`、`token`、引擎配置、LLM provider 配置。
-- `token` 已存在时，插件默认不再用本地 `bot_name` / `avatar_url` / `description` / `chess_style` / `persona_prompt` 覆盖网站资料，以网站端资料为准。
-- 如需恢复旧行为（启动时将本地首次注册资料同步覆盖到网站端），可打开高级兼容开关 `sync_profile_to_server`。
+- **网站端管理**：Bot 名字、头像、简介、棋风、人格、公开状态。
+- **插件端管理**：`arena_base`、`token`、引擎配置、LLM provider 配置、超时和自动接挑战。
+- 插件启动时会读取网站端资料用于显示和台词，不再在 AstrBot 配置页暴露“首次注册资料/高级兼容”这些容易误改的字段。
 
 ## QQ 命令
 
@@ -105,6 +102,7 @@ AstrBot 棋擂台 Arena 客户端插件 — 连接楚河 Bot 棋擂台平台，�
 
 ## 版本历史
 
+- **3.2.1** — 精简 AstrBot 配置页，移除首次注册资料/高级兼容字段；Bot 资料统一在棋擂台网站后台管理
 - **3.0.6** — 新增 `auto/server_xqwlight/local_xqwlight/custom_command/custom_http/random` 双引擎/自定义引擎链，兼容旧 `xqwlight`，所有引擎输出校验 `legal_moves`
 - **3.0.4** — WebUI 走棋模式改为 `random` / `xqwlight` 二选一，默认启用 xqwlight，并暴露 `engine_depth`
 - **3.0.3** — 移除公开版公网 IP 默认兜底
@@ -126,7 +124,7 @@ AstrBot 棋擂台 Arena 客户端插件 — 连接楚河 Bot 棋擂台平台，�
 
 ## LLM 模型选择
 
-插件配置页新增：
+插件配置页保留：
 
 - `llm_provider_mode`: `default` 使用 AstrBot 当前默认对话模型；`custom` 使用手动填写的 Provider ID。
 - `llm_provider_id`: 手动指定 Provider ID，仅在 `custom` 时生效。

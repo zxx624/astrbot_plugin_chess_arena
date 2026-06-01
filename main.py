@@ -40,18 +40,13 @@ class ChessArenaPlugin(Star):
         self.arena_fallback_bases = self._parse_fallback_bases(self.config.get("arena_fallback_bases"))
         self.token = str(self.config.get("token") or "").strip()
         self.auto_register = bool(self.config.get("auto_register", True))
-        self.sync_profile_to_server = self._config_bool(self.config.get("sync_profile_to_server"), default=False)
         self.server_profile: dict[str, Any] = {}
-        configured_bot_name = str(self.config.get("bot_name") or "").strip()
-        self._generated_bot_name = not configured_bot_name
-        self.bot_name = configured_bot_name or self._default_bot_name()
-        self.avatar_url = str(self.config.get("avatar_url") or "").strip()
-        self.description = str(self.config.get("description") or "AstrBot Chess Arena bot").strip()
-        self.chess_style = str(self.config.get("chess_style") or "random").strip() or "random"
-        self.persona_prompt = str(
-            self.config.get("persona_prompt")
-            or "像群里真人下棋，自然、松弛、有一点胜负欲，不要像客服。"
-        ).strip()
+        self._generated_bot_name = not str(self.config.get("bot_name") or "").strip()
+        self.bot_name = self._default_bot_name()
+        self.avatar_url = ""
+        self.description = "AstrBot Chess Arena bot"
+        self.chess_style = "random"
+        self.persona_prompt = "像群里真人下棋，自然、松弛、有一点胜负欲，不要像客服。"
         self.commentary_enabled = bool(self.config.get("commentary_enabled", True))
         self.commentary_timeout_sec = int(self.config.get("commentary_timeout_sec") or 8)
         self.llm_provider_mode = str(self.config.get("llm_provider_mode") or "default").strip().lower()
@@ -95,10 +90,7 @@ class ChessArenaPlugin(Star):
                 await self._schedule_startup_retry()
                 return
 
-            if self.sync_profile_to_server:
-                await self._patch_bot_settings()
-            else:
-                logger.info("[ChessArena] sync_profile_to_server=false，启动时仅读取服务端 profile，不覆盖网页端资料。")
+            logger.info("[ChessArena] 已读取网站端 profile；Bot 资料统一由网站管理，插件端不覆盖。")
             self._sse_task = asyncio.create_task(self._sse_loop(), name="chess_arena_sse_loop")
             logger.info(
                 "[ChessArena] SSE 客户端已启动: %s bot=%s token=%s",
@@ -279,34 +271,11 @@ class ChessArenaPlugin(Star):
 
         self._startup_task = asyncio.create_task(_retry(), name="chess_arena_startup_retry")
 
-    async def _patch_bot_settings(self) -> None:
-        payload = self._bot_settings_payload(include_client=False)
-        _base, status, text = await self._request_text_with_fallback(
-            "PATCH",
-            "/api/bots/me",
-            json_payload=payload,
-            headers=self._auth_headers(),
-            timeout=aiohttp.ClientTimeout(total=10),
-        )
-        if status >= 400:
-            logger.warning("[ChessArena] 上报 Bot 设置失败: HTTP %s %s", status, text[:200])
-            return
-        try:
-            data = json.loads(text) if text else {}
-            refreshed_profile = self._extract_server_profile(data)
-            self.server_profile = refreshed_profile or self._extract_server_profile(payload)
-        except json.JSONDecodeError:
-            self.server_profile = self._extract_server_profile(payload)
-        logger.info("[ChessArena] 已上报 Bot 设置: name=%s style=%s", self.bot_name, self.chess_style)
-
     def _bot_settings_payload(self, include_client: bool = False) -> dict[str, Any]:
+        # Bot 的公开资料（名字、头像、简介、棋风、人格）统一在网站后台填写。
+        # 插件只在 token 为空自动注册时提交一个最小资料，避免把 AstrBot 本地旧配置反向覆盖网站端。
         payload: dict[str, Any] = {
             "name": self.bot_name,
-            "avatar_url": self.avatar_url,
-            "description": self.description,
-            "chess_style": self.chess_style,
-            "persona_prompt": self.persona_prompt,
-            "engine_mode": self.engine_mode,
             "is_public": True,
         }
         if include_client:
@@ -377,11 +346,6 @@ class ChessArenaPlugin(Star):
             "arena_fallback_bases": ",".join(self.arena_fallback_bases),
             "token": token,
             "auto_register": self.auto_register,
-            "bot_name": self.bot_name,
-            "avatar_url": self.avatar_url,
-            "description": self.description,
-            "chess_style": self.chess_style,
-            "persona_prompt": self.persona_prompt,
             "commentary_enabled": self.commentary_enabled,
             "commentary_timeout_sec": self.commentary_timeout_sec,
             "llm_provider_mode": self.llm_provider_mode,
@@ -1057,7 +1021,7 @@ class ChessArenaPlugin(Star):
             f"引擎/棋风：{self.engine_mode}/{self.effective_chess_style}\n"
             f"引擎链：{' -> '.join(self._engine_chain())}\n"
             f"本地Node：{self._local_engine_node_status()}\n"
-            f"自动注册/同步资料/自动接挑战：{self.auto_register}/{self.sync_profile_to_server}/{self.auto_accept_challenges}\n"
+            f"自动注册/自动接挑战：{self.auto_register}/{self.auto_accept_challenges}\n"
             f"走棋台词：{self.commentary_enabled}\n"
             f"LLM模型：{self._llm_provider_status()}\n"
             f"已接挑战/已走棋：{self.state.accepted_challenges}/{self.state.submitted_moves}\n"
