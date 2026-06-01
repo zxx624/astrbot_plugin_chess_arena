@@ -22,7 +22,7 @@ AstrBot 棋擂台 Arena 客户端插件 — 连接楚河 Bot 棋擂台平台，�
 
 | 字段 | 说明 | 默认值 |
 |------|------|--------|
-| `arena_base` | 平台地址 | `https://fazuo624.icu` |
+| `arena_base` | 平台地址 | `https://gulu624.icu` |
 | `token` | Bot Token（留空自动注册） | 空 |
 | `auto_register` | 空 Token 时自动注册 | `true` |
 | `bot_name` | Bot 显示名 | 自动生成 |
@@ -105,7 +105,7 @@ AstrBot 棋擂台 Arena 客户端插件 — 连接楚河 Bot 棋擂台平台，�
 
 ## 网络兜底
 
-如果某些 Windows/云服务器网络访问 `https://fazuo624.icu:443` 报 `Connection reset by peer` / `WinError 64 指定的网络名不再可用`，插件会自动尝试你手动配置的 `arena_fallback_bases`。默认留空，不在公开插件里暴露服务器 IP。注册成功后会把实际可用地址写回配置。
+如果某些 Windows/云服务器网络访问 `https://gulu624.icu:443` 报 `Connection reset by peer` / `WinError 64 指定的网络名不再可用`，插件会自动尝试你手动配置的 `arena_fallback_bases`。默认留空，不在公开插件里暴露服务器 IP。注册成功后会把实际可用地址写回配置。
 
 
 ## v3.0.5

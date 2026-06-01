@@ -36,7 +36,7 @@ class ChessArenaPlugin(Star):
     def __init__(self, context: Context, config: dict | None = None):
         super().__init__(context)
         self.config = config or {}
-        self.arena_base = str(self.config.get("arena_base") or "https://fazuo624.icu").rstrip("/")
+        self.arena_base = str(self.config.get("arena_base") or "https://gulu624.icu").rstrip("/")
         self.arena_fallback_bases = self._parse_fallback_bases(self.config.get("arena_fallback_bases"))
         self.token = str(self.config.get("token") or "").strip()
         self.auto_register = bool(self.config.get("auto_register", True))

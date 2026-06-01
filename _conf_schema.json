@@ -3,7 +3,7 @@
     "description": "棋擂台平台地址",
     "type": "string",
     "hint": "平台 HTTP/SSE Base URL，不要以 / 结尾",
-    "default": "https://fazuo624.icu"
+    "default": "https://gulu624.icu"
   },
   "arena_fallback_bases": {
     "description": "备用平台地址",
