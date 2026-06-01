@@ -40,6 +40,8 @@ class ChessArenaPlugin(Star):
         self.arena_fallback_bases = self._parse_fallback_bases(self.config.get("arena_fallback_bases"))
         self.token = str(self.config.get("token") or "").strip()
         self.auto_register = bool(self.config.get("auto_register", True))
+        self.sync_profile_to_server = self._config_bool(self.config.get("sync_profile_to_server"), default=False)
+        self.server_profile: dict[str, Any] = {}
         configured_bot_name = str(self.config.get("bot_name") or "").strip()
         self._generated_bot_name = not configured_bot_name
         self.bot_name = configured_bot_name or self._default_bot_name()
@@ -76,7 +78,7 @@ class ChessArenaPlugin(Star):
         self._startup_task = asyncio.create_task(self._startup(), name="chess_arena_startup")
 
     async def _startup(self) -> None:
-        """启动流程：必要时自动注册，验证 token，上报 Bot 设置，然后连接 SSE。"""
+        """启动流程：必要时自动注册，验证 token，按配置同步/拉取 profile，然后连接 SSE。"""
         try:
             if not self.token and self.auto_register:
                 await self._auto_register_bot()
@@ -93,9 +95,17 @@ class ChessArenaPlugin(Star):
                 await self._schedule_startup_retry()
                 return
 
-            await self._patch_bot_settings()
+            if self.sync_profile_to_server:
+                await self._patch_bot_settings()
+            else:
+                logger.info("[ChessArena] sync_profile_to_server=false，启动时仅读取服务端 profile，不覆盖网页端资料。")
             self._sse_task = asyncio.create_task(self._sse_loop(), name="chess_arena_sse_loop")
-            logger.info("[ChessArena] SSE 客户端已启动: %s bot=%s token=%s", self.arena_base, self.bot_name, self._token_hint(self.token))
+            logger.info(
+                "[ChessArena] SSE 客户端已启动: %s bot=%s token=%s",
+                self.arena_base,
+                self.effective_bot_name,
+                self._token_hint(self.token),
+            )
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - plugin startup must not crash AstrBot
@@ -135,6 +145,21 @@ class ChessArenaPlugin(Star):
             if base and base not in bases:
                 bases.append(base)
         return bases
+
+    @staticmethod
+    def _config_bool(value: Any, *, default: bool = False) -> bool:
+        if value is None or value == "":
+            return default
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        text = str(value).strip().lower()
+        if text in {"1", "true", "yes", "y", "on", "启用", "是"}:
+            return True
+        if text in {"0", "false", "no", "n", "off", "禁用", "否"}:
+            return False
+        return default
 
     async def _request_text_with_fallback(
         self,
@@ -194,8 +219,13 @@ class ChessArenaPlugin(Star):
         logger.info("[ChessArena] 自动注册成功 bot_id=%s token=%s", data.get("bot_id") or data.get("id"), self._token_hint(token))
         await self._save_registration_to_runtime_config(token)
 
-    async def _verify_token(self) -> bool | None:
-        """Return True for valid token, False for auth failure, None for network/server failure."""
+    async def _fetch_server_profile(self) -> bool | None:
+        """验证 token 并拉取服务端 Bot profile。
+
+        Return True for valid token, False for auth failure, None for network/server failure.
+        成功时只缓存 name/avatar_url/description/chess_style/persona_prompt 等网页端 profile 字段，
+        不把本地配置反向覆盖到服务端。
+        """
         try:
             _base, status, text = await self._request_text_with_fallback(
                 "GET",
@@ -209,11 +239,22 @@ class ChessArenaPlugin(Star):
             if status >= 400:
                 logger.warning("[ChessArena] token 验证遇到服务端/临时错误: HTTP %s %s", status, text[:200])
                 return None
-            logger.info("[ChessArena] token 验证成功: %s", self._short(json.loads(text) if text else {}))
+            try:
+                data = json.loads(text) if text else {}
+            except json.JSONDecodeError as exc:
+                self.state.last_error = f"fetch profile non-json: {exc}"
+                logger.warning("[ChessArena] token 验证返回非 JSON，稍后重试: %s", text[:200])
+                return None
+            self.server_profile = self._extract_server_profile(data)
+            logger.info("[ChessArena] token 验证成功，已拉取服务端 profile: %s", self._short(self.server_profile))
             return True
         except Exception as exc:  # noqa: BLE001
             logger.warning("[ChessArena] token 验证网络异常，稍后重试，不判定 token 无效: %s", exc)
             return None
+
+    async def _verify_token(self) -> bool | None:
+        """Return True for valid token, False for auth failure, None for network/server failure."""
+        return await self._fetch_server_profile()
 
     async def _verify_token_with_retry(self) -> bool | None:
         last: bool | None = None
@@ -250,6 +291,12 @@ class ChessArenaPlugin(Star):
         if status >= 400:
             logger.warning("[ChessArena] 上报 Bot 设置失败: HTTP %s %s", status, text[:200])
             return
+        try:
+            data = json.loads(text) if text else {}
+            refreshed_profile = self._extract_server_profile(data)
+            self.server_profile = refreshed_profile or self._extract_server_profile(payload)
+        except json.JSONDecodeError:
+            self.server_profile = self._extract_server_profile(payload)
         logger.info("[ChessArena] 已上报 Bot 设置: name=%s style=%s", self.bot_name, self.chess_style)
 
     def _bot_settings_payload(self, include_client: bool = False) -> dict[str, Any]:
@@ -265,6 +312,41 @@ class ChessArenaPlugin(Star):
         if include_client:
             payload.update({"client_type": "astrbot", "instance_name": self._instance_name()})
         return payload
+
+    @staticmethod
+    def _extract_server_profile(data: Any) -> dict[str, Any]:
+        if not isinstance(data, dict):
+            return {}
+        source = data
+        for key in ("bot", "data", "profile"):
+            nested = data.get(key)
+            if isinstance(nested, dict):
+                source = nested
+                break
+        profile: dict[str, Any] = {}
+        for key in ("name", "avatar_url", "description", "chess_style", "persona_prompt"):
+            value = source.get(key)
+            if value is not None and str(value).strip():
+                profile[key] = str(value).strip()
+        return profile
+
+    def _profile_value(self, key: str, local_default: str = "") -> str:
+        value = self.server_profile.get(key)
+        if value is not None and str(value).strip():
+            return str(value).strip()
+        return str(local_default or "").strip()
+
+    @property
+    def effective_bot_name(self) -> str:
+        return self._profile_value("name", self.bot_name)
+
+    @property
+    def effective_chess_style(self) -> str:
+        return self._profile_value("chess_style", self.chess_style) or "random"
+
+    @property
+    def effective_persona_prompt(self) -> str:
+        return self._profile_value("persona_prompt", self.persona_prompt)
 
     async def _save_registration_to_runtime_config(self, token: str) -> None:
         """把自动注册结果写回 AstrBot 插件 runtime config，便于打开配置页直接看到 token。"""
@@ -507,8 +589,8 @@ class ChessArenaPlugin(Star):
             "side": side,
             "depth": max(1, self.engine_depth),
             "timeout_ms": self.engine_timeout_sec * 1000,
-            "bot_name": self.bot_name,
-            "chess_style": self.chess_style,
+            "bot_name": self.effective_bot_name,
+            "chess_style": self.effective_chess_style,
         }
 
     @staticmethod
@@ -713,10 +795,13 @@ class ChessArenaPlugin(Star):
             return fallback
 
         forbidden = self._comment_forbidden_claims(facts)
+        bot_name = self.effective_bot_name
+        chess_style = self.effective_chess_style
+        persona_prompt = self.effective_persona_prompt
         fact_lines = [
-            f"Bot 名字：{self.bot_name}",
-            f"棋风：{self.chess_style}",
-            f"人格设定：{self.persona_prompt}",
+            f"Bot 名字：{bot_name}",
+            f"棋风：{chess_style}",
+            f"人格设定：{persona_prompt}",
             f"本步 UCCI：{move}",
             f"中文走法：{facts.get('notation') or move}",
             f"移动棋子：{facts.get('piece_name') or '未知'}",
@@ -967,12 +1052,12 @@ class ChessArenaPlugin(Star):
         msg = (
             f"棋擂台状态：{status}\n"
             f"平台：{self.arena_base}\n"
-            f"Bot：{self.bot_name}\n"
+            f"Bot：{self.effective_bot_name}\n"
             f"Token：{token_status}（{self._token_hint(self.token)}）\n"
-            f"引擎/棋风：{self.engine_mode}/{self.chess_style}\n"
+            f"引擎/棋风：{self.engine_mode}/{self.effective_chess_style}\n"
             f"引擎链：{' -> '.join(self._engine_chain())}\n"
             f"本地Node：{self._local_engine_node_status()}\n"
-            f"自动注册/自动接挑战：{self.auto_register}/{self.auto_accept_challenges}\n"
+            f"自动注册/同步资料/自动接挑战：{self.auto_register}/{self.sync_profile_to_server}/{self.auto_accept_challenges}\n"
             f"走棋台词：{self.commentary_enabled}\n"
             f"LLM模型：{self._llm_provider_status()}\n"
             f"已接挑战/已走棋：{self.state.accepted_challenges}/{self.state.submitted_moves}\n"

@@ -23,32 +23,40 @@
     "hint": "启动时 POST /api/bots/register 获取 token 并尝试保存到 AstrBot runtime config",
     "default": true
   },
+  "sync_profile_to_server": {
+    "description": "高级兼容：是否在启动时把本地首次注册资料同步覆盖到网站端",
+    "type": "bool",
+    "hint": "默认关闭；token 已存在时默认以网站端资料为准，不用本地配置覆盖网站资料。需要旧版启动即同步覆盖行为时再开启。",
+    "default": false
+  },
   "bot_name": {
-    "description": "Bot 显示名称",
+    "description": "首次注册资料/高级兼容：Bot 显示名称",
     "type": "string",
-    "hint": "留空时使用 AstrBot/主机名生成默认名称",
+    "hint": "仅首次自动注册时作为初始资料；token 已存在时默认以网站端资料为准，不覆盖网站 Bot 名字。需要旧行为可开启 sync_profile_to_server。",
     "default": ""
   },
   "avatar_url": {
-    "description": "Bot 头像 URL",
+    "description": "首次注册资料/高级兼容：Bot 头像 URL",
     "type": "string",
+    "hint": "仅首次自动注册时作为初始资料；token 已存在时默认以网站端资料为准，不覆盖网站头像。需要旧行为可开启 sync_profile_to_server。",
     "default": ""
   },
   "description": {
-    "description": "Bot 简介",
+    "description": "首次注册资料/高级兼容：Bot 简介",
     "type": "string",
+    "hint": "仅首次自动注册时作为初始资料；token 已存在时默认以网站端资料为准，不覆盖网站简介。需要旧行为可开启 sync_profile_to_server。",
     "default": "AstrBot Chess Arena bot"
   },
   "chess_style": {
-    "description": "棋风",
+    "description": "首次注册资料/高级兼容：棋风",
     "type": "string",
-    "hint": "random/aggressive/steady/defensive/greedy/showman；V0.2 用于选步偏好和台词风格",
+    "hint": "random/aggressive/steady/defensive/greedy/showman；仅首次自动注册时作为初始资料；token 已存在时默认以网站端资料为准，不覆盖网站棋风。需要旧行为可开启 sync_profile_to_server。",
     "default": "random"
   },
   "persona_prompt": {
-    "description": "下棋台词人格",
+    "description": "首次注册资料/高级兼容：下棋台词人格",
     "type": "text",
-    "hint": "只用于生成短台词，不决定走法",
+    "hint": "只用于生成短台词，不决定走法；仅首次自动注册时作为初始资料；token 已存在时默认以网站端资料为准，不覆盖网站人格。需要旧行为可开启 sync_profile_to_server。",
     "default": "像群里真人下棋，自然、松弛、有一点胜负欲，不要像客服。"
   },
   "commentary_enabled": {

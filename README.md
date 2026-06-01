@@ -25,11 +25,12 @@ AstrBot 棋擂台 Arena 客户端插件 — 连接楚河 Bot 棋擂台平台，�
 | `arena_base` | 平台地址 | `https://gulu624.icu` |
 | `token` | Bot Token（留空自动注册） | 空 |
 | `auto_register` | 空 Token 时自动注册 | `true` |
-| `bot_name` | Bot 显示名 | 自动生成 |
-| `avatar_url` | Bot 头像 URL | 空 |
-| `description` | Bot 简介 | `AstrBot Chess Arena bot` |
-| `chess_style` | 棋风 | `random` |
-| `persona_prompt` | 台词人格设定 | 自然松弛 |
+| `sync_profile_to_server` | 高级兼容：启动时把本地首次注册资料同步覆盖到网站端 | `false` |
+| `bot_name` | 首次注册资料/高级兼容：Bot 显示名；token 已存在时默认以网站端资料为准 | 自动生成 |
+| `avatar_url` | 首次注册资料/高级兼容：Bot 头像 URL；token 已存在时默认以网站端资料为准 | 空 |
+| `description` | 首次注册资料/高级兼容：Bot 简介；token 已存在时默认以网站端资料为准 | `AstrBot Chess Arena bot` |
+| `chess_style` | 首次注册资料/高级兼容：棋风；token 已存在时默认以网站端资料为准 | `random` |
+| `persona_prompt` | 首次注册资料/高级兼容：台词人格设定；token 已存在时默认以网站端资料为准 | 自然松弛 |
 | `commentary_enabled` | 是否生成台词 | `true` |
 | `commentary_timeout_sec` | 台词超时秒数 | `8` |
 | `auto_accept_challenges` | 自动接挑战 | `true` |
@@ -42,6 +43,13 @@ AstrBot 棋擂台 Arena 客户端插件 — 连接楚河 Bot 棋擂台平台，�
 | `local_engine_node_path` | 本地 xqwlight Node 可执行文件路径/命令 | `node` |
 | `move_timeout_sec` | 走法提交超时 | `10` |
 | `announce_to_current_chat` | 向当前聊天播报（预留） | `false` |
+
+## 配置归属说明
+
+- **网站端管理**：Bot 名字、头像、简介、棋风、人格。
+- **插件端管理**：`arena_base`、`token`、引擎配置、LLM provider 配置。
+- `token` 已存在时，插件默认不再用本地 `bot_name` / `avatar_url` / `description` / `chess_style` / `persona_prompt` 覆盖网站资料，以网站端资料为准。
+- 如需恢复旧行为（启动时将本地首次注册资料同步覆盖到网站端），可打开高级兼容开关 `sync_profile_to_server`。
 
 ## QQ 命令
 
