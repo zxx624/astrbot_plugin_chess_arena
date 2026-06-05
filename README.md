@@ -85,7 +85,12 @@ AstrBot/
 | `commentary_timeout_sec` | int | `8` | LLM 台词生成超时秒数；超时不影响走棋。 |
 | `llm_provider_mode` | string | `default` | `default` 使用 AstrBot 当前默认对话模型；`custom` 使用手动 Provider ID。 |
 | `llm_provider_id` | string | 空 | 手动指定 AstrBot Provider ID，仅 `custom` 模式生效。不可用时自动回退默认模型。 |
-| `auto_accept_challenges` | bool | `true` | 收到挑战后自动接受。 |
+| `auto_accept_challenges` | bool | `true` | 旧兼容项；未显式设置 `challenge_decision_mode` 时，`true` 等价于 `auto_accept`，`false` 等价于 `ignore`。 |
+| `challenge_decision_mode` | string | `auto_accept` | 收到挑战后的处理方式：`auto_accept` 自动同意；`owner_approve` 先等主人确认；`ignore` 只记录不处理。 |
+| `owner_notify_enabled` | bool | `true` | `owner_approve` 模式下是否尝试主动发送主人审批提醒。 |
+| `owner_notify_targets` | string | 空 | 挑战审批消息发给谁；填写 QQ号/微信ID/平台会话ID，多个用英文逗号分隔。留空则只在当前会话命令里显示待确认，不主动私聊。 |
+| `owner_decision_timeout_sec` | int | `180` | 主人审批超时时间；应与网站端 Bot `owner_review_timeout_sec` 保持接近。 |
+| `match_report_enabled` | bool | `true` | 对局结束后是否汇报最近结果（依赖插件实现和平台事件/查询能力）。 |
 | `engine_mode` | string | `auto` | 走棋模式，见下方“走棋模式”。 |
 | `engine_depth` | int | `3` | xqwlight/自定义引擎搜索深度。建议 1-6。 |
 | `engine_timeout_sec` | int | `8` | 单个引擎调用超时秒数。 |
@@ -215,11 +220,17 @@ LLM 只用于生成走棋台词，不参与棋力决策。
 
 | 命令 | 说明 |
 |---|---|
-| `棋擂台状态` | 查看连接状态、最近事件、错误、接挑战/提交走法计数、当前引擎配置。 |
+| `棋擂台状态` | 查看连接状态、最近事件、错误、挑战处理模式、待确认数量、接挑战/提交走法计数、当前引擎配置。 |
 | `棋擂台在线` | 主动检查平台 HTTP 可达性。 |
-| `棋擂台挑战 <bot_id>` | 用当前 Bot Token 向指定 Bot 发起挑战。 |
+| `棋擂台挑战 <对手名字或bot_id> [红|黑|随机]` | 搜索对手并发起挑战；对方若开启主人审批，会提示等待确认。 |
+| `棋擂台找对手 [强一点|弱一点|随机|在线]` | 从平台 Bot 列表/排行中挑选一个可挑战对手。 |
+| `棋擂台当前` | 查询当前 Bot 正在进行的对局、轮次和链接。 |
+| `棋擂台最近` | 查询当前 Bot 最近对局结果。 |
+| `棋擂台待确认` | 查看正在等待主人审批的挑战。 |
+| `棋擂台同意 [challenge_id]` | 同意指定或最近一条待确认挑战，调用网站 `owner_decision=accept` 并返回对局链接。 |
+| `棋擂台拒绝 [challenge_id]` | 拒绝指定或最近一条待确认挑战，调用网站 `owner_decision=reject`。 |
 
-命令名称以代码实现为准；如果你的 AstrBot 命令前缀有变化，请按 AstrBot 当前配置发送。
+主人审批提示会包含当前 Bot 名字/id 和挑战编号，避免多 Bot 部署时混淆。命令名称以代码实现为准；如果你的 AstrBot 命令前缀有变化，请按 AstrBot 当前配置发送。
 
 ## 网络兜底
 
@@ -409,6 +420,7 @@ grep -RInE '(sk-<token-pattern>|AKID<secret-id-pattern>|<server-password>|<api-t
 
 ## 版本历史
 
+- **3.3.0** — 主人审批挑战流程、待确认/同意/拒绝命令、按名字挑战/找对手/当前/最近查询命令。
 - **3.2.4** — 修复挑战/走棋提交使用备用平台地址；配置页移除旧 `xqwlight` 选项但保留兼容映射。
 - **3.2.3** — 补全 README：安装、配置归属、引擎链、自定义引擎、LLM 台词、日志、排错和发布检查说明。
 - **3.2.2** — 新增 `verbose_logging` 开关；默认把 SSE/事件/选步/提交走法等日常日志降为 DEBUG，减少 AstrBot 控制台刷屏。

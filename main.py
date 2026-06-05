@@ -5,6 +5,7 @@ import glob
 import json
 import os
 import socket
+import inspect
 import random
 import shlex
 import shutil
@@ -16,7 +17,8 @@ from urllib.parse import quote
 
 import aiohttp
 from astrbot.api import logger
-from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.event import AstrMessageEvent, MessageChain, filter
+from astrbot.api.message_components import Plain
 from astrbot.api.star import Context, Star
 
 
@@ -54,6 +56,13 @@ class ChessArenaPlugin(Star):
             self.llm_provider_mode = "default"
         self.llm_provider_id = str(self.config.get("llm_provider_id") or "").strip()
         self.auto_accept_challenges = bool(self.config.get("auto_accept_challenges", True))
+        self.challenge_decision_mode = self._normalize_challenge_decision_mode(self.config.get("challenge_decision_mode"))
+        self.server_challenge_policy = self._server_challenge_policy_for_mode(self.challenge_decision_mode)
+        self.owner_notify_enabled = self._config_bool(self.config.get("owner_notify_enabled"), default=True)
+        self.owner_notify_targets = str(self.config.get("owner_notify_targets") or "").strip()
+        self.owner_decision_timeout_sec = max(1, int(self.config.get("owner_decision_timeout_sec") or 180))
+        self.match_report_enabled = self._config_bool(self.config.get("match_report_enabled"), default=True)
+        self.pending_owner_challenges: dict[str, dict[str, Any]] = {}
         self.engine_mode = self._normalize_engine_mode(self.config.get("engine_mode") or "auto")
         self.engine_depth = int(self.config.get("engine_depth") or 3)
         self.engine_timeout_sec = max(1, int(self.config.get("engine_timeout_sec") or 8))
@@ -161,6 +170,21 @@ class ChessArenaPlugin(Star):
         else:
             logger.debug(message, *args)
 
+    def _normalize_challenge_decision_mode(self, value: Any) -> str:
+        """兼容旧 auto_accept_challenges：未显式配置新模式时按旧布尔值映射。"""
+        raw = str(value or "").strip().lower()
+        if raw in {"auto_accept", "owner_approve", "ignore"}:
+            return raw
+        return "auto_accept" if self.auto_accept_challenges else "ignore"
+
+    @staticmethod
+    def _server_challenge_policy_for_mode(mode: str) -> str:
+        if mode == "owner_approve":
+            return "manual_approve"
+        if mode == "ignore":
+            return "reject_all"
+        return "auto_accept"
+
     async def _request_text_with_fallback(
         self,
         method: str,
@@ -191,6 +215,170 @@ class ChessArenaPlugin(Star):
                 last_error = f"{base}: {exc}"
                 logger.warning("[ChessArena] 连接棋擂台失败，将尝试备用地址: %s", last_error)
         raise RuntimeError(f"all arena bases failed for {method} {path}: {last_error}")
+
+    async def _api_json(
+        self,
+        method: str,
+        path: str,
+        json_payload: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+        timeout: aiohttp.ClientTimeout | None = None,
+    ) -> tuple[str, int, dict[str, Any] | list[Any], str]:
+        base, status, text = await self._request_text_with_fallback(
+            method,
+            path,
+            json_payload=json_payload,
+            headers=headers,
+            timeout=timeout,
+        )
+        try:
+            data = json.loads(text) if text else {}
+        except json.JSONDecodeError:
+            data = {}
+        return base, status, data, text
+
+    def _match_url(self, match_id: Any) -> str:
+        return f"{self.arena_base}/matches/{quote(str(match_id), safe='')}"
+
+    def _my_bot_id(self) -> str:
+        for key in ("bot_id", "id"):
+            value = self.server_profile.get(key)
+            if value is not None and str(value).strip():
+                return str(value).strip()
+        return ""
+
+    @staticmethod
+    def _list_from_response(data: Any, *keys: str) -> list[dict[str, Any]]:
+        items: Any = data
+        if isinstance(data, dict):
+            for key in keys or ("bots", "items", "matches", "data"):
+                value = data.get(key)
+                if isinstance(value, list):
+                    items = value
+                    break
+                if isinstance(value, dict):
+                    for nested_key in ("bots", "items", "matches"):
+                        if isinstance(value.get(nested_key), list):
+                            items = value.get(nested_key)
+                            break
+        if not isinstance(items, list):
+            return []
+        return [item for item in items if isinstance(item, dict)]
+
+    @staticmethod
+    def _bot_id(bot: dict[str, Any]) -> str:
+        return str(bot.get("bot_id") or bot.get("id") or "").strip()
+
+    @staticmethod
+    def _bot_name(bot: dict[str, Any]) -> str:
+        return str(bot.get("name") or bot.get("bot_name") or bot.get("display_name") or "").strip()
+
+    def _is_self_bot(self, bot: dict[str, Any]) -> bool:
+        my_id = self._my_bot_id()
+        bot_id = self._bot_id(bot)
+        if my_id and bot_id and my_id == bot_id:
+            return True
+        name = self._bot_name(bot)
+        return bool(name and name == self.effective_bot_name)
+
+    @staticmethod
+    def _bot_priority(bot: dict[str, Any]) -> tuple[int, int, int]:
+        online = bool(bot.get("online", bot.get("is_online", False)))
+        enabled = bool(bot.get("is_enabled", bot.get("enabled", True)))
+        public = bool(bot.get("is_public", bot.get("public", True)))
+        return (1 if online else 0, 1 if enabled else 0, 1 if public else 0)
+
+    @staticmethod
+    def _bot_available(bot: dict[str, Any]) -> bool:
+        online = bot.get("online", bot.get("is_online", False))
+        enabled = bot.get("is_enabled", bot.get("enabled", True))
+        public = bot.get("is_public", bot.get("public", True))
+        return bool(online) and bool(enabled) and bool(public)
+
+    async def _fetch_bots(self, query: str = "") -> list[dict[str, Any]]:
+        path = "/api/bots"
+        if query:
+            path += f"?q={quote(query, safe='')}"
+        _base, status, data, _text = await self._api_json(
+            "GET",
+            path,
+            headers=self._auth_headers() if self.token else None,
+            timeout=aiohttp.ClientTimeout(total=10),
+        )
+        if status >= 400 and query:
+            _base, status, data, _text = await self._api_json(
+                "GET",
+                "/api/bots",
+                headers=self._auth_headers() if self.token else None,
+                timeout=aiohttp.ClientTimeout(total=10),
+            )
+        if status >= 400:
+            raise RuntimeError(f"HTTP {status}")
+        return self._list_from_response(data, "bots", "items", "data")
+
+    async def _find_bot(self, query: str, exclude_self: bool = True) -> tuple[dict[str, Any] | None, str]:
+        query = str(query or "").strip()
+        if not query:
+            return None, "你要挑战谁？用法：棋擂台挑战 <名字或bot_id> [红|黑|随机]"
+        bots = await self._fetch_bots(query)
+        if exclude_self:
+            bots = [bot for bot in bots if not self._is_self_bot(bot)]
+        q = query.lower()
+        stages = [
+            [bot for bot in bots if self._bot_id(bot).lower() == q],
+            [bot for bot in bots if self._bot_name(bot).lower() == q],
+            [bot for bot in bots if q in self._bot_name(bot).lower()],
+        ]
+        for matches in stages:
+            if not matches:
+                continue
+            matches = sorted(matches, key=self._bot_priority, reverse=True)
+            best_pri = self._bot_priority(matches[0])
+            best = [bot for bot in matches if self._bot_priority(bot) == best_pri]
+            if len(best) == 1:
+                return best[0], ""
+            names = "、".join(f"{self._bot_name(bot) or '未命名'}({self._bot_id(bot)})" for bot in best[:5])
+            return None, f"找到多个对手：{names}。请用 bot_id 指定。"
+        return None, f"没找到对手：{query}"
+
+    @staticmethod
+    def _parse_side(value: str) -> str:
+        side = str(value or "随机").strip().lower()
+        mapping = {"红": "red", "红方": "red", "red": "red", "r": "red", "黑": "black", "黑方": "black", "black": "black", "b": "black", "随机": "random", "随便": "random", "random": "random"}
+        return mapping.get(side, "random")
+
+    @staticmethod
+    def _side_cn(side: Any) -> str:
+        return {"red": "红方", "black": "黑方", "random": "随机"}.get(str(side or "").lower(), str(side or "未知"))
+
+    @staticmethod
+    def _api_error_cn(status: int, data: Any, text: str) -> str:
+        code = ""
+        message = ""
+        if isinstance(data, dict):
+            code = str(data.get("code") or data.get("error") or data.get("reason") or "")
+            message = str(data.get("message") or data.get("detail") or "")
+        if status == 409 and code == "bot_busy":
+            return "对方正在下棋，暂时约不了。"
+        if status == 409:
+            return "对方或我方正忙，稍后再试。"
+        return message or code or text[:120] or f"HTTP {status}"
+
+    def _format_challenge_reply(self, opponent: dict[str, Any], side: str, status: int, data: Any, text: str) -> str:
+        name = self._bot_name(opponent) or self._bot_id(opponent)
+        if status >= 400:
+            return f"挑战 {name} 失败：{self._api_error_cn(status, data, text)}"
+        payload = data if isinstance(data, dict) else {}
+        match_id = payload.get("match_id") or payload.get("matchId")
+        challenge_id = payload.get("challenge_id") or payload.get("challengeId")
+        state = str(payload.get("status") or payload.get("state") or "").lower()
+        if match_id or state in {"started", "active", "playing"}:
+            link = f"\n{self._match_url(match_id)}" if match_id else ""
+            return f"已挑战 {name}（我执{self._side_cn(side)}），已开局！{link}"
+        if state in {"pending_owner", "owner_pending", "need_approval", "waiting_owner"}:
+            return f"已挑战 {name}（我执{self._side_cn(side)}），等待主人确认。"
+        suffix = f"（#{challenge_id}）" if challenge_id else ""
+        return f"已挑战 {name}（我执{self._side_cn(side)}），等待对方接招{suffix}。"
 
     async def _auto_register_bot(self) -> None:
         payload = self._bot_settings_payload(include_client=True)
@@ -246,6 +434,7 @@ class ChessArenaPlugin(Star):
                 logger.warning("[ChessArena] token 验证返回非 JSON，稍后重试: %s", text[:200])
                 return None
             self.server_profile = self._extract_server_profile(data)
+            await self._sync_server_challenge_policy(data)
             self._routine_log("[ChessArena] token 验证成功，已拉取服务端 profile: %s", self._short(self.server_profile))
             return True
         except Exception as exc:  # noqa: BLE001
@@ -301,11 +490,52 @@ class ChessArenaPlugin(Star):
                 source = nested
                 break
         profile: dict[str, Any] = {}
-        for key in ("name", "avatar_url", "description", "chess_style", "persona_prompt"):
+        for key in ("bot_id", "id", "name", "avatar_url", "description", "chess_style", "persona_prompt", "challenge_policy", "owner_review_timeout_sec"):
             value = source.get(key)
             if value is not None and str(value).strip():
                 profile[key] = str(value).strip()
         return profile
+
+    @staticmethod
+    def _response_source(data: Any) -> dict[str, Any]:
+        if not isinstance(data, dict):
+            return {}
+        for key in ("bot", "data", "profile"):
+            nested = data.get(key)
+            if isinstance(nested, dict):
+                return nested
+        return data
+
+    async def _sync_server_challenge_policy(self, profile_response: Any = None) -> None:
+        expected_policy = self.server_challenge_policy
+        source = self._response_source(profile_response) if profile_response is not None else self.server_profile
+        current_policy = str(source.get("challenge_policy") or "").strip()
+        current_timeout = int(float(source.get("owner_review_timeout_sec") or 0)) if str(source.get("owner_review_timeout_sec") or "").strip() else 0
+        payload: dict[str, Any] = {}
+        if current_policy != expected_policy:
+            payload["challenge_policy"] = expected_policy
+        if expected_policy == "manual_approve" and current_timeout != self.owner_decision_timeout_sec:
+            payload["owner_review_timeout_sec"] = self.owner_decision_timeout_sec
+        if not payload:
+            return
+        try:
+            _base, status, text = await self._request_text_with_fallback(
+                "PATCH",
+                "/api/bots/me",
+                json_payload=payload,
+                headers=self._auth_headers(),
+                timeout=aiohttp.ClientTimeout(total=10),
+            )
+            if status >= 400:
+                logger.warning("[ChessArena] 同步挑战审批策略失败: HTTP %s %s", status, text[:200])
+                return
+            data = json.loads(text) if text else {}
+            synced = self._extract_server_profile(data)
+            if synced:
+                self.server_profile.update(synced)
+            self._routine_log("[ChessArena] 已同步挑战审批策略到网站: %s", payload)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[ChessArena] 同步挑战审批策略异常，不影响启动: %s", exc)
 
     def _profile_value(self, key: str, local_default: str = "") -> str:
         value = self.server_profile.get(key)
@@ -359,6 +589,13 @@ class ChessArenaPlugin(Star):
             "llm_provider_mode": self.llm_provider_mode,
             "llm_provider_id": self.llm_provider_id,
             "auto_accept_challenges": self.auto_accept_challenges,
+            "challenge_decision_mode": self.challenge_decision_mode,
+            "challenge_policy": self.server_challenge_policy,
+            "owner_notify_enabled": self.owner_notify_enabled,
+            "owner_notify_targets": self.owner_notify_targets,
+            "owner_decision_timeout_sec": self.owner_decision_timeout_sec,
+            "owner_review_timeout_sec": self.owner_decision_timeout_sec,
+            "match_report_enabled": self.match_report_enabled,
             "engine_mode": self.engine_mode,
             "engine_depth": self.engine_depth,
             "engine_timeout_sec": self.engine_timeout_sec,
@@ -502,13 +739,33 @@ class ChessArenaPlugin(Star):
             await self._handle_your_turn(payload)
 
     async def _handle_challenge_received(self, event: dict[str, Any]) -> None:
-        if not self.auto_accept_challenges:
-            self._routine_log("[ChessArena] 已忽略挑战：auto_accept_challenges=false")
-            return
-        challenge_id = event.get("challenge_id") or event.get("challengeId") or event.get("id")
+        challenge_id = self._challenge_id(event)
         if not challenge_id:
             logger.warning("[ChessArena] challenge_received 缺少 id: %s", event)
             return
+
+        mode = self.challenge_decision_mode
+        if mode == "ignore":
+            self._routine_log("[ChessArena] 已忽略挑战 %s：challenge_decision_mode=ignore", challenge_id)
+            return
+        if mode == "auto_accept":
+            await self._accept_challenge(challenge_id)
+            return
+
+        # owner_approve：只登记/通知，不阻塞 SSE；主人稍后用命令同意/拒绝。
+        record = dict(event)
+        record["challenge_id"] = str(challenge_id)
+        record["received_at"] = time.time()
+        self.pending_owner_challenges[str(challenge_id)] = record
+        text = self._owner_challenge_text(record)
+        if self.owner_notify_enabled:
+            try:
+                await self._notify_owner(text)
+            except Exception as exc:  # noqa: BLE001 - 主动通知失败不能影响 SSE
+                logger.warning("[ChessArena] 主人挑战审批通知失败，已保留待确认: %s", exc)
+        self._routine_log("[ChessArena] 挑战 %s 等待主人审批", challenge_id)
+
+    async def _accept_challenge(self, challenge_id: Any) -> dict[str, Any]:
         _base, status, text = await self._request_text_with_fallback(
             "POST",
             f"/api/challenges/{quote(str(challenge_id), safe='')}/accept",
@@ -518,6 +775,10 @@ class ChessArenaPlugin(Star):
             raise RuntimeError(f"accept challenge failed: HTTP {status} {text[:200]}")
         self.state.accepted_challenges += 1
         self._routine_log("[ChessArena] 已接受挑战 %s", challenge_id)
+        try:
+            return json.loads(text) if text else {}
+        except json.JSONDecodeError:
+            return {"raw": text}
 
     async def _handle_your_turn(self, event: dict[str, Any]) -> None:
         legal_moves = event.get("legal_moves") or event.get("legalMoves") or []
@@ -1018,6 +1279,150 @@ class ChessArenaPlugin(Star):
             return f"这步先调整一下。（{notation}）"
         return f"先走这步，看看你怎么接。（{notation}）"
 
+    @staticmethod
+    def _challenge_id(event: dict[str, Any]) -> Any:
+        return event.get("challenge_id") or event.get("challengeId") or event.get("id")
+
+    def _challenge_value(self, event: dict[str, Any], *keys: str) -> str:
+        for key in keys:
+            value = event.get(key)
+            if value is not None and str(value).strip():
+                return str(value).strip()
+        return ""
+
+    def _owner_challenge_text(self, event: dict[str, Any]) -> str:
+        challenge_id = str(self._challenge_id(event) or "")
+        challenger = self._challenge_value(event, "challenger_name", "challengerName", "challenger", "from_name") or "未知对手"
+        opponent = self._challenge_value(event, "opponent_name", "opponentName", "opponent") or self.effective_bot_name
+        side = self._challenge_value(event, "side", "bot_side", "botSide", "color", "assigned_side") or "未知"
+        side_label = {"red": "红方/先手", "black": "黑方/后手", "r": "红方/先手", "b": "黑方/后手"}.get(side.lower(), side)
+        expires_at = self._challenge_value(event, "expires_at", "expiresAt", "expire_at", "expireAt") or "未知"
+        return (
+            "收到棋擂台挑战，等待主人审批：\n"
+            f"Bot：{opponent or self.effective_bot_name}\n"
+            f"对手：{challenger}\n"
+            f"挑战ID：{challenge_id}\n"
+            f"红黑/先后：{side_label}\n"
+            f"过期时间：{expires_at}\n"
+            f"请回复：棋擂台同意 {challenge_id} / 棋擂台拒绝 {challenge_id}"
+        )
+
+    def _owner_notify_target_list(self) -> list[str]:
+        raw = str(self.owner_notify_targets or "").replace("\n", ",")
+        targets: list[str] = []
+        for item in raw.split(","):
+            target = item.strip()
+            if target and target not in targets:
+                targets.append(target)
+        return targets
+
+    async def _notify_owner(self, text: str) -> None:
+        targets = self._owner_notify_target_list()
+        if not targets:
+            self._routine_log("[ChessArena] owner_notify_targets 为空，仅保留待确认挑战，不主动私聊。")
+            return
+        sender = getattr(self.context, "send_message", None)
+        if not callable(sender):
+            logger.warning("[ChessArena] 当前 AstrBot Context 无 send_message，无法主动通知主人。")
+            return
+        chain = MessageChain([Plain(text)])
+        for target in targets:
+            for umo in self._target_umo_candidates(target):
+                try:
+                    result = sender(umo, chain)
+                    if inspect.isawaitable(result):
+                        await result
+                    self._routine_log("[ChessArena] 已发送挑战审批通知到 %s", umo)
+                    break
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("[ChessArena] 发送挑战审批通知到 %s 失败: %s", umo, exc)
+
+    def _target_umo_candidates(self, target: str) -> list[str]:
+        target = str(target or "").strip()
+        if not target:
+            return []
+        if target.count(":") >= 2:
+            return [target]
+        platform = self._default_platform_id()
+        candidates: list[str] = []
+        if platform:
+            candidates.append(f"{platform}:FriendMessage:{target}")
+            candidates.append(f"{platform}:GroupMessage:{target}")
+        return candidates or [target]
+
+    def _default_platform_id(self) -> str:
+        for attr in ("platform", "platform_id", "id"):
+            value = getattr(self.context, attr, None)
+            if value and isinstance(value, str):
+                return value
+        return str(self.config.get("owner_notify_platform") or "aiocqhttp").strip() or "aiocqhttp"
+
+    def _pending_challenge_lines(self) -> list[str]:
+        self._prune_expired_pending_challenges()
+        if not self.pending_owner_challenges:
+            return []
+        lines: list[str] = []
+        for challenge_id, event in sorted(self.pending_owner_challenges.items(), key=lambda item: item[1].get("received_at", 0), reverse=True):
+            challenger = self._challenge_value(event, "challenger_name", "challengerName", "challenger", "from_name") or "未知对手"
+            side = self._challenge_value(event, "side", "bot_side", "botSide", "color", "assigned_side") or "未知"
+            expires_at = self._challenge_value(event, "expires_at", "expiresAt") or "未知"
+            lines.append(f"- {challenge_id}：{challenger}，红黑/先后={side}，过期={expires_at}")
+        return lines
+
+    def _latest_pending_challenge_id(self) -> str:
+        self._prune_expired_pending_challenges()
+        if not self.pending_owner_challenges:
+            return ""
+        return max(self.pending_owner_challenges.items(), key=lambda item: item[1].get("received_at", 0))[0]
+
+    def _prune_expired_pending_challenges(self) -> None:
+        if not self.pending_owner_challenges:
+            return
+        now = time.time()
+        timeout = max(1, self.owner_decision_timeout_sec)
+        expired = [cid for cid, item in self.pending_owner_challenges.items() if now - float(item.get("received_at") or now) > timeout]
+        for cid in expired:
+            self.pending_owner_challenges.pop(cid, None)
+
+    async def _submit_owner_decision(self, challenge_id: str, decision: str, reason: str = "") -> dict[str, Any]:
+        payload: dict[str, Any] = {"decision": decision}
+        if reason:
+            payload["reason"] = reason
+        _base, status, text = await self._request_text_with_fallback(
+            "POST",
+            f"/api/challenges/{quote(str(challenge_id), safe='')}/owner_decision",
+            json_payload=payload,
+            headers=self._auth_headers(),
+            timeout=aiohttp.ClientTimeout(total=10),
+        )
+        if status >= 400:
+            raise RuntimeError(f"owner_decision failed: HTTP {status} {text[:200]}")
+        try:
+            return json.loads(text) if text else {}
+        except json.JSONDecodeError:
+            return {"raw": text}
+
+    def _format_owner_decision_result(self, challenge_id: str, decision: str, data: dict[str, Any]) -> str:
+        if decision == "reject":
+            return f"已拒绝挑战 {challenge_id}。"
+        match_url = str(data.get("match_url") or data.get("matchUrl") or "").strip()
+        match = data.get("match") if isinstance(data.get("match"), dict) else {}
+        challenge = data.get("challenge") if isinstance(data.get("challenge"), dict) else data
+        if not match_url and isinstance(match, dict):
+            match_url = str(match.get("match_url") or match.get("url") or "").strip()
+        match_id = ""
+        if isinstance(match, dict):
+            match_id = str(match.get("id") or match.get("match_id") or match.get("matchId") or "").strip()
+        status = str(challenge.get("status") or data.get("status") or "").strip() if isinstance(challenge, dict) else ""
+        parts = [f"已同意挑战 {challenge_id}。"]
+        if match_id:
+            parts.append(f"对局ID：{match_id}")
+        if match_url:
+            parts.append(f"对局链接：{match_url}")
+        elif status:
+            parts.append(f"状态：{status}")
+        return "\n".join(parts)
+
     @filter.command("棋擂台状态")
     async def arena_status(self, event: AstrMessageEvent):
         """查看棋擂台连接和自动对弈状态。"""
@@ -1034,7 +1439,10 @@ class ChessArenaPlugin(Star):
             f"引擎/棋风：{self.engine_mode}/{self.effective_chess_style}\n"
             f"引擎链：{' -> '.join(self._engine_chain())}\n"
             f"本地Node：{self._local_engine_node_status()}\n"
-            f"自动注册/自动接挑战：{self.auto_register}/{self.auto_accept_challenges}\n"
+            f"自动注册/旧自动接挑战：{self.auto_register}/{self.auto_accept_challenges}\n"
+            f"挑战处理模式：{self.challenge_decision_mode}\n"
+            f"主人通知目标：{'已配置' if self._owner_notify_target_list() else '未配置'}\n"
+            f"待主人确认：{len(self._pending_challenge_lines())}\n"
             f"走棋台词：{self.commentary_enabled}\n"
             f"LLM模型：{self._llm_provider_status()}\n"
             f"已接挑战/已走棋：{self.state.accepted_challenges}/{self.state.submitted_moves}\n"
@@ -1057,6 +1465,48 @@ class ChessArenaPlugin(Star):
         script_ok = script.exists()
         return f"node={'可用' if node_ok else '不可用'} analyze.js={'存在' if script_ok else '缺失'}"
 
+    @filter.command("棋擂台待确认")
+    async def arena_pending_challenges(self, event: AstrMessageEvent):
+        """查看等待主人审批的挑战。"""
+        lines = self._pending_challenge_lines()
+        if not lines:
+            yield event.plain_result("当前没有待确认挑战。")
+            return
+        yield event.plain_result(
+            "待确认挑战：\n"
+            + "\n".join(lines)
+            + "\n回复：棋擂台同意 <id> / 棋擂台拒绝 <id>；不填 id 则处理最新一条。"
+        )
+
+    @filter.command("棋擂台同意")
+    async def arena_accept_pending(self, event: AstrMessageEvent, challenge_id: str = ""):
+        """同意待审批挑战；不传 id 时使用最新 pending。"""
+        cid = str(challenge_id or self._latest_pending_challenge_id()).strip()
+        if not cid:
+            yield event.plain_result("当前没有待确认挑战。")
+            return
+        try:
+            data = await self._submit_owner_decision(cid, "accept")
+            self.pending_owner_challenges.pop(cid, None)
+            self.state.accepted_challenges += 1
+            yield event.plain_result(self._format_owner_decision_result(cid, "accept", data))
+        except Exception as exc:  # noqa: BLE001
+            yield event.plain_result(f"同意挑战失败：{exc}")
+
+    @filter.command("棋擂台拒绝")
+    async def arena_reject_pending(self, event: AstrMessageEvent, challenge_id: str = ""):
+        """拒绝待审批挑战；不传 id 时使用最新 pending。"""
+        cid = str(challenge_id or self._latest_pending_challenge_id()).strip()
+        if not cid:
+            yield event.plain_result("当前没有待确认挑战。")
+            return
+        try:
+            data = await self._submit_owner_decision(cid, "reject", reason="owner rejected from AstrBot")
+            self.pending_owner_challenges.pop(cid, None)
+            yield event.plain_result(self._format_owner_decision_result(cid, "reject", data))
+        except Exception as exc:  # noqa: BLE001
+            yield event.plain_result(f"拒绝挑战失败：{exc}")
+
     @filter.command("棋擂台在线")
     async def arena_online(self, event: AstrMessageEvent):
         """主动检查棋擂台 HTTP 可达性。"""
@@ -1074,27 +1524,135 @@ class ChessArenaPlugin(Star):
         except Exception as exc:  # noqa: BLE001
             yield event.plain_result(f"棋擂台在线检查异常：{exc}")
 
+    async def _challenge_bot(self, opponent: dict[str, Any], side: str) -> str:
+        opponent_id = self._bot_id(opponent)
+        payload = {"opponent_bot_id": opponent_id, "side": side}
+        _base, status, data, text = await self._api_json(
+            "POST",
+            "/api/challenges",
+            json_payload=payload,
+            headers=self._auth_headers(),
+            timeout=aiohttp.ClientTimeout(total=10),
+        )
+        return self._format_challenge_reply(opponent, side, status, data, text)
+
     @filter.command("棋擂台挑战")
-    async def arena_challenge(self, event: AstrMessageEvent, bot_id: str):
-        """向指定 bot_id 发起挑战。"""
-        if not bot_id:
-            yield event.plain_result("用法：棋擂台挑战 <bot_id>")
+    async def arena_challenge(self, event: AstrMessageEvent, target: str = "", side_text: str = "随机"):
+        """向指定名字或 bot_id 发起挑战。"""
+        if not target:
+            yield event.plain_result("用法：棋擂台挑战 <名字或bot_id> [红|黑|随机]")
             return
         try:
-            payload = {"opponent_bot_id": bot_id, "side": "random"}
-            base, status, text = await self._request_text_with_fallback(
-                "POST",
-                "/api/challenges",
-                json_payload=payload,
+            side = self._parse_side(side_text)
+            bot, error = await self._find_bot(target)
+            if error or not bot:
+                yield event.plain_result(error or "没找到对手。")
+                return
+            yield event.plain_result(await self._challenge_bot(bot, side))
+        except Exception as exc:  # noqa: BLE001
+            yield event.plain_result(f"挑战失败：{exc}")
+
+    @filter.command("棋擂台找对手")
+    async def arena_find_opponent(self, event: AstrMessageEvent, mode: str = "在线"):
+        """自动挑一个可用对手并挑战。"""
+        try:
+            bots = [bot for bot in await self._fetch_bots() if not self._is_self_bot(bot) and self._bot_available(bot)]
+            if not bots:
+                yield event.plain_result("现在没找到在线可用对手。")
+                return
+            mode = str(mode or "在线").strip()
+            if mode == "随机":
+                opponent = random.choice(bots)
+            else:
+                bots = sorted(bots, key=self._bot_priority, reverse=True)
+                if mode == "强一点":
+                    opponent = max(bots, key=lambda b: float(b.get("rating") or b.get("score") or b.get("elo") or 0))
+                elif mode == "弱一点":
+                    opponent = min(bots, key=lambda b: float(b.get("rating") or b.get("score") or b.get("elo") or 0))
+                else:
+                    opponent = bots[0]
+            yield event.plain_result(await self._challenge_bot(opponent, "random"))
+        except Exception as exc:  # noqa: BLE001
+            yield event.plain_result(f"找对手失败：{exc}")
+
+    def _match_bot_ids(self, match: dict[str, Any]) -> set[str]:
+        ids: set[str] = set()
+        for key in ("red_bot_id", "black_bot_id", "winner_bot_id"):
+            value = match.get(key)
+            if value is not None and str(value).strip():
+                ids.add(str(value).strip())
+        for side in ("red", "black"):
+            bot = match.get(side) or match.get(f"{side}_bot")
+            if isinstance(bot, dict) and self._bot_id(bot):
+                ids.add(self._bot_id(bot))
+        return ids
+
+    def _match_involves_me(self, match: dict[str, Any]) -> bool:
+        my_id = self._my_bot_id()
+        if my_id and my_id in self._match_bot_ids(match):
+            return True
+        names = {str(match.get("red_name") or match.get("red_bot_name") or ""), str(match.get("black_name") or match.get("black_bot_name") or "")}
+        return self.effective_bot_name in names
+
+    @staticmethod
+    def _match_status(match: dict[str, Any]) -> str:
+        return str(match.get("status") or match.get("state") or "").lower()
+
+    def _match_side_name(self, match: dict[str, Any], side: str) -> str:
+        bot = match.get(side) or match.get(f"{side}_bot")
+        if isinstance(bot, dict):
+            return self._bot_name(bot) or self._bot_id(bot)
+        return str(match.get(f"{side}_name") or match.get(f"{side}_bot_name") or match.get(f"{side}_bot_id") or "未知")
+
+    def _match_ply(self, match: dict[str, Any]) -> Any:
+        moves = match.get("moves") or match.get("move_list")
+        if isinstance(moves, list):
+            return len(moves)
+        return match.get("ply") or match.get("move_count") or match.get("moves_count") or 0
+
+    async def _fetch_matches(self) -> list[dict[str, Any]]:
+        for path in ("/api/admin/matches?limit=30", "/api/matches?limit=30"):
+            _base, status, data, _text = await self._api_json(
+                "GET",
+                path,
                 headers=self._auth_headers(),
                 timeout=aiohttp.ClientTimeout(total=10),
             )
-            if status >= 400:
-                yield event.plain_result(f"发起挑战失败：{base} HTTP {status} {text[:200]}")
-            else:
-                yield event.plain_result(f"已发起挑战 {bot_id}：{text[:300]}")
+            if status < 400:
+                return self._list_from_response(data, "matches", "items", "data")
+        return []
+
+    @filter.command("棋擂台当前")
+    async def arena_current(self, event: AstrMessageEvent):
+        try:
+            active = [m for m in await self._fetch_matches() if self._match_involves_me(m) and self._match_status(m) in {"active", "playing", "started", "running"}]
+            if not active:
+                yield event.plain_result("当前没在下。")
+                return
+            match = active[0]
+            match_id = match.get("match_id") or match.get("id")
+            turn = match.get("turn") or match.get("current_turn") or match.get("side_to_move") or "未知"
+            yield event.plain_result(f"当前对局：红 {self._match_side_name(match, 'red')} vs 黑 {self._match_side_name(match, 'black')}。{self._match_ply(match)}手，轮到{self._side_cn(turn)}。\n{self._match_url(match_id)}")
         except Exception as exc:  # noqa: BLE001
-            yield event.plain_result(f"发起挑战异常：{exc}")
+            yield event.plain_result(f"查询当前对局失败：{exc}")
+
+    @filter.command("棋擂台最近")
+    async def arena_recent(self, event: AstrMessageEvent):
+        try:
+            mine = [m for m in await self._fetch_matches() if self._match_involves_me(m)]
+            if not mine:
+                yield event.plain_result("还没找到我的最近对局。")
+                return
+            match = mine[0]
+            match_id = match.get("match_id") or match.get("id")
+            winner = str(match.get("winner_bot_id") or "")
+            my_id = self._my_bot_id()
+            result = "和棋" if not winner else ("赢了" if my_id and winner == my_id else "输了")
+            opponent = self._match_side_name(match, "black") if self._match_side_name(match, "red") == self.effective_bot_name else self._match_side_name(match, "red")
+            reason = match.get("finish_reason") or match.get("reason") or "未知原因"
+            yield event.plain_result(f"最近一局：{result}，对手 {opponent}，{self._match_ply(match)}手，原因：{reason}。\n{self._match_url(match_id)}")
+        except Exception as exc:  # noqa: BLE001
+            yield event.plain_result(f"查询最近对局失败：{exc}")
 
     def _auth_headers(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {self.token}", "X-Bot-Token": self.token}

@@ -51,9 +51,44 @@
     "default": ""
   },
   "auto_accept_challenges": {
-    "description": "自动接受挑战",
+    "description": "自动接受挑战（旧配置）",
     "type": "bool",
-    "hint": "收到 challenge_received 事件后自动 POST /api/challenges/{id}/accept",
+    "hint": "兼容旧配置；未配置 challenge_decision_mode 时，true=auto_accept，false=ignore。新安装建议使用下面的挑战处理模式。",
+    "default": true
+  },
+  "challenge_decision_mode": {
+    "description": "挑战处理模式",
+    "type": "string",
+    "hint": "auto_accept=收到挑战自动接受；owner_approve=先发给主人审批，主人回复命令后再开局；ignore=只记录日志不处理。若留空则按旧 auto_accept_challenges 兼容映射。",
+    "default": "auto_accept",
+    "options": [
+      "auto_accept",
+      "owner_approve",
+      "ignore"
+    ]
+  },
+  "owner_notify_enabled": {
+    "description": "启用主人审批通知",
+    "type": "bool",
+    "hint": "仅 challenge_decision_mode=owner_approve 时生效；通知失败不会影响 SSE，仍可用 棋擂台待确认 查看。",
+    "default": true
+  },
+  "owner_notify_targets": {
+    "description": "主人审批通知目标",
+    "type": "string",
+    "hint": "挑战审批消息发给谁；填写 QQ号/微信ID/平台会话ID，多个用英文逗号分隔；留空则只在当前会话命令里显示待确认，不主动私聊",
+    "default": ""
+  },
+  "owner_decision_timeout_sec": {
+    "description": "主人审批超时秒数",
+    "type": "int",
+    "hint": "本地 pending 列表保留时长；超时后从 棋擂台待确认 隐藏。插件启动时也会把该值同步为网站端 owner_review_timeout_sec。",
+    "default": 180
+  },
+  "match_report_enabled": {
+    "description": "启用对局结果报告",
+    "type": "bool",
+    "hint": "预留给对局结束/开局报告；当前审批命令成功后会回复对局链接。",
     "default": true
   },
   "engine_mode": {
