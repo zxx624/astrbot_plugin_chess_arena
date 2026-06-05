@@ -34,6 +34,12 @@
     "hint": "若可用 LLM provider，会在此超时内尝试生成；失败则使用本地模板，不影响走棋",
     "default": 8
   },
+  "llm_tools_enabled": {
+    "description": "启用 LLM 工具",
+    "type": "bool",
+    "hint": "允许 AstrBot 对话模型调用棋擂台工具查询状态、找对手、发起挑战、查看/处理待审批挑战。工具返回内容不得包含完整 token。",
+    "default": true
+  },
   "llm_provider_mode": {
     "description": "LLM模型选择方式",
     "type": "string",
@@ -49,6 +55,12 @@
     "type": "string",
     "hint": "仅当 LLM模型选择方式=custom 时生效。填写 AstrBot 模型/Provider 的 ID；留空或不可用会自动回退默认对话模型。",
     "default": ""
+  },
+  "llm_tools_allow_actions": {
+    "description": "允许 LLM 工具执行操作",
+    "type": "bool",
+    "hint": "关闭时 LLM 工具只能查询 status/find_bots/pending；开启后才允许 challenge 和 owner_decision 这类会发起挑战/同意/拒绝的操作。建议确认当前模型工具调用可靠后再开启。",
+    "default": false
   },
   "auto_accept_challenges": {
     "description": "自动接受挑战（旧配置）",

@@ -21,6 +21,23 @@ from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.message_components import Plain
 from astrbot.api.star import Context, Star
 
+try:  # AstrBot 新版优先从 astrbot.api 暴露 FunctionTool。
+    from astrbot.api import FunctionTool as AstrFunctionTool
+except Exception:  # noqa: BLE001 - 不同 AstrBot 版本可能没有该导出
+    AstrFunctionTool = None
+
+try:  # 兼容部分 AstrBot 版本的底层工具类型。
+    from astrbot.api import ToolExecResult as AstrToolExecResult
+except Exception:  # noqa: BLE001
+    AstrToolExecResult = None
+
+try:
+    from pydantic import Field
+    from pydantic.dataclasses import dataclass as pydantic_dataclass
+except Exception:  # noqa: BLE001 - 注册 LLM 工具失败不能影响插件启动
+    Field = None
+    pydantic_dataclass = None
+
 
 @dataclass
 class ArenaState:
@@ -55,6 +72,8 @@ class ChessArenaPlugin(Star):
         if self.llm_provider_mode not in {"default", "custom"}:
             self.llm_provider_mode = "default"
         self.llm_provider_id = str(self.config.get("llm_provider_id") or "").strip()
+        self.llm_tools_enabled = self._config_bool(self.config.get("llm_tools_enabled"), default=True)
+        self.llm_tools_allow_actions = self._config_bool(self.config.get("llm_tools_allow_actions"), default=False)
         self.auto_accept_challenges = bool(self.config.get("auto_accept_challenges", True))
         self.challenge_decision_mode = self._normalize_challenge_decision_mode(self.config.get("challenge_decision_mode"))
         self.server_challenge_policy = self._server_challenge_policy_for_mode(self.challenge_decision_mode)
@@ -79,6 +98,10 @@ class ChessArenaPlugin(Star):
         self._sse_task: asyncio.Task | None = None
         self._startup_task: asyncio.Task | None = None
         self._stopping = asyncio.Event()
+        self._llm_tools_registered = False
+
+        if self.llm_tools_enabled:
+            self._register_llm_tools_safe()
 
         self._startup_task = asyncio.create_task(self._startup(), name="chess_arena_startup")
 
@@ -169,6 +192,289 @@ class ChessArenaPlugin(Star):
             logger.info(message, *args)
         else:
             logger.debug(message, *args)
+
+    def _register_llm_tools_safe(self) -> None:
+        """向 AstrBot 默认聊天模型注册棋擂台工具；任何失败都只记录 warning。"""
+        try:
+            registrar = getattr(self.context, "add_llm_tools", None)
+            if not callable(registrar):
+                logger.warning("[ChessArena] 当前 AstrBot Context 不支持 add_llm_tools，跳过棋擂台 LLM 工具注册。")
+                return
+
+            function_tool_cls, tool_exec_result_cls = self._llm_tool_classes()
+            if function_tool_cls is None:
+                logger.warning("[ChessArena] 当前 AstrBot 版本未提供 FunctionTool，跳过棋擂台 LLM 工具注册。")
+                return
+
+            tools = [
+                self._build_llm_function_tool(
+                    function_tool_cls,
+                    tool_exec_result_cls,
+                    "chess_arena_status",
+                    "查看棋擂台连接状态、Bot、平台、引擎链和待确认挑战数量。",
+                    self._llm_tool_status,
+                    self._tool_parameters({}),
+                ),
+                self._build_llm_function_tool(
+                    function_tool_cls,
+                    tool_exec_result_cls,
+                    "chess_arena_find_bots",
+                    "查询或列出可挑战的棋擂台 Bot，最多返回 8 个。",
+                    self._llm_tool_find_bots,
+                    self._tool_parameters(
+                        {
+                            "query": {"type": "string", "description": "Bot 名称或 bot_id 关键词；空则列出可见 Bot。"},
+                        }
+                    ),
+                ),
+                self._build_llm_function_tool(
+                    function_tool_cls,
+                    tool_exec_result_cls,
+                    "chess_arena_challenge",
+                    "按名字或 bot_id 向棋擂台 Bot 发起挑战。",
+                    self._llm_tool_challenge,
+                    self._tool_parameters(
+                        {
+                            "opponent": {"type": "string", "description": "对手 Bot 名称或 bot_id。"},
+                            "side": {"type": "string", "description": "我方执红/黑/随机；允许 red、black、random、红、黑。"},
+                        },
+                        required=["opponent"],
+                    ),
+                ),
+                self._build_llm_function_tool(
+                    function_tool_cls,
+                    tool_exec_result_cls,
+                    "chess_arena_pending_challenges",
+                    "列出等待主人审批的棋擂台挑战。",
+                    self._llm_tool_pending_challenges,
+                    self._tool_parameters({}),
+                ),
+                self._build_llm_function_tool(
+                    function_tool_cls,
+                    tool_exec_result_cls,
+                    "chess_arena_owner_decision",
+                    "同意或拒绝一条等待主人审批的棋擂台挑战；不传 challenge_id 时处理最新一条。",
+                    self._llm_tool_owner_decision,
+                    self._tool_parameters(
+                        {
+                            "challenge_id": {"type": "string", "description": "挑战 ID；为空时默认最新一条待确认。"},
+                            "decision": {"type": "string", "description": "只能是 accept 或 reject。"},
+                            "reason": {"type": "string", "description": "拒绝原因，可为空；不要包含隐私或凭据。"},
+                        },
+                    ),
+                ),
+            ]
+            self._call_add_llm_tools(registrar, tools)
+            self._llm_tools_registered = True
+            self._routine_log("[ChessArena] 已注册棋擂台 LLM 工具: %s", ", ".join(getattr(tool, "name", "") for tool in tools))
+        except Exception as exc:  # noqa: BLE001 - LLM 工具不可影响插件启动/SSE/自动走棋
+            logger.warning("[ChessArena] 注册棋擂台 LLM 工具失败，已跳过: %s", exc)
+
+    @staticmethod
+    def _tool_parameters(properties: dict[str, Any], required: list[str] | None = None) -> dict[str, Any]:
+        return {"type": "object", "properties": properties, "required": required or []}
+
+    @staticmethod
+    def _llm_tool_classes() -> tuple[Any, Any]:
+        function_tool_cls = AstrFunctionTool
+        tool_exec_result_cls = AstrToolExecResult
+        if function_tool_cls is None:
+            try:
+                from astrbot.core.agent.tool import FunctionTool as CoreFunctionTool  # type: ignore
+                from astrbot.core.agent.tool import ToolExecResult as CoreToolExecResult  # type: ignore
+
+                function_tool_cls = CoreFunctionTool
+                tool_exec_result_cls = tool_exec_result_cls or CoreToolExecResult
+            except Exception:  # noqa: BLE001
+                return None, tool_exec_result_cls
+        elif tool_exec_result_cls is None:
+            try:
+                from astrbot.core.agent.tool import ToolExecResult as CoreToolExecResult  # type: ignore
+
+                tool_exec_result_cls = CoreToolExecResult
+            except Exception:  # noqa: BLE001
+                pass
+        return function_tool_cls, tool_exec_result_cls
+
+    def _build_llm_function_tool(
+        self,
+        function_tool_cls: Any,
+        tool_exec_result_cls: Any,
+        name: str,
+        description: str,
+        handler: Any,
+        parameters: dict[str, Any],
+    ) -> Any:
+        async def callback(*args: Any, **kwargs: Any) -> Any:
+            kwargs.pop("ctx", None)
+            kwargs.pop("context", None)
+            return self._llm_tool_result(await handler(**kwargs), tool_exec_result_cls)
+
+        constructors = [
+            lambda: function_tool_cls(name=name, description=description, parameters=parameters, func=callback),
+            lambda: function_tool_cls(name=name, description=description, parameters=parameters, handler=callback),
+            lambda: function_tool_cls(name=name, desc=description, parameters=parameters, func=callback),
+            lambda: function_tool_cls(callback, name=name, description=description, parameters=parameters),
+            lambda: function_tool_cls(name, description, parameters, callback),
+        ]
+        for factory_name in ("from_callable", "from_function", "from_func"):
+            factory = getattr(function_tool_cls, factory_name, None)
+            if callable(factory):
+                constructors.append(lambda factory=factory: factory(callback, name=name, description=description, parameters=parameters))
+        for constructor in constructors:
+            try:
+                return constructor()
+            except Exception:  # noqa: BLE001 - 尝试其它 AstrBot 版本的构造方式
+                continue
+
+        if pydantic_dataclass is not None and Field is not None:
+            plugin = self
+
+            @pydantic_dataclass
+            class ChessArenaLLMTool(function_tool_cls):  # type: ignore[misc, valid-type]
+                name: str = ""
+                description: str = ""
+                parameters: dict[str, Any] = Field(default_factory=dict)
+                handler: Any = Field(default=None, repr=False)
+                plugin: Any = Field(default=plugin, repr=False)
+                result_cls: Any = Field(default=tool_exec_result_cls, repr=False)
+
+                async def run(self, ctx: Any = None, **kwargs: Any) -> Any:  # noqa: ANN001
+                    result = self.handler(**kwargs)
+                    if inspect.isawaitable(result):
+                        result = await result
+                    return self.plugin._llm_tool_result(result, self.result_cls)
+
+            return ChessArenaLLMTool(name=name, description=description, parameters=parameters, handler=handler)
+
+        raise RuntimeError(f"cannot construct FunctionTool {name}")
+
+    def _call_add_llm_tools(self, registrar: Any, tools: list[Any]) -> None:
+        try:
+            signature = inspect.signature(registrar)
+            params = list(signature.parameters.values())
+            use_varargs = any(param.kind == inspect.Parameter.VAR_POSITIONAL for param in params)
+        except Exception:  # noqa: BLE001
+            use_varargs = False
+        calls = [lambda: registrar(*tools), lambda: registrar(tools)] if use_varargs else [lambda: registrar(tools), lambda: registrar(*tools)]
+        last_error = ""
+        for call in calls:
+            try:
+                result = call()
+                if inspect.isawaitable(result):
+                    try:
+                        loop = asyncio.get_running_loop()
+                        task = loop.create_task(result, name="chess_arena_add_llm_tools")
+                        task.add_done_callback(self._log_add_llm_tools_task_result)
+                    except RuntimeError:
+                        logger.warning("[ChessArena] add_llm_tools 返回 awaitable，但当前无运行事件循环；已跳过等待。")
+                return
+            except Exception as exc:  # noqa: BLE001
+                last_error = str(exc)
+        raise RuntimeError(last_error or "add_llm_tools call failed")
+
+    @staticmethod
+    def _log_add_llm_tools_task_result(task: asyncio.Task) -> None:
+        try:
+            task.result()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[ChessArena] 异步注册棋擂台 LLM 工具失败，已跳过: %s", exc)
+
+    def _llm_tool_result(self, value: Any, tool_exec_result_cls: Any = None) -> Any:
+        text = self._safe_llm_tool_text(value)
+        if tool_exec_result_cls is not None:
+            try:
+                return tool_exec_result_cls(text)
+            except Exception:  # noqa: BLE001
+                pass
+        return text
+
+    def _safe_llm_tool_text(self, value: Any, limit: int = 700) -> str:
+        text = str(value or "").strip()
+        if self.token:
+            text = text.replace(self.token, "[token-redacted]")
+            text = text.replace(self._token_hint(self.token), "[token-redacted]")
+        text = " ".join(text.split()) if "\n" not in text[:200] else text.strip()
+        if len(text) > limit:
+            text = text[: limit - 1] + "…"
+        return text or "完成。"
+
+    async def _llm_tool_status(self) -> str:
+        try:
+            status = "在线" if self.state.connected else "离线"
+            pending_count = len(self._pending_challenge_lines())
+            engine_chain = " -> ".join(self._engine_chain())
+            return (
+                f"连接：{status}\n"
+                f"Bot：{self.effective_bot_name}\n"
+                f"平台：{self.arena_base}\n"
+                f"引擎链：{engine_chain}\n"
+                f"待确认：{pending_count}"
+            )
+        except Exception as exc:  # noqa: BLE001
+            return f"查询状态失败：{exc}"
+
+    async def _llm_tool_find_bots(self, query: str = "") -> str:
+        try:
+            bots = [bot for bot in await self._fetch_bots(str(query or "").strip()) if not self._is_self_bot(bot)]
+            bots = sorted(bots, key=self._bot_priority, reverse=True)[:8]
+            if not bots:
+                return "未找到可列出的 Bot。"
+            lines = []
+            for bot in bots:
+                name = self._bot_name(bot) or "未命名"
+                bot_id = self._bot_id(bot) or "未知ID"
+                online = "在线" if bool(bot.get("online", bot.get("is_online", False))) else "离线"
+                available = "可用" if self._bot_available(bot) else "不可用"
+                lines.append(f"- {name} ({bot_id})：{online}/{available}")
+            return "可挑战 Bot：\n" + "\n".join(lines)
+        except Exception as exc:  # noqa: BLE001
+            return f"查询 Bot 失败：{exc}"
+
+    async def _llm_tool_challenge(self, opponent: str = "", side: str = "random") -> str:
+        try:
+            if not self.llm_tools_allow_actions:
+                return "LLM 工具操作权限未开启：只能查询，不能发起挑战。"
+            opponent = str(opponent or "").strip()
+            if not opponent:
+                return "请提供 opponent（名字或 bot_id）。"
+            if not self.token:
+                return "Token 未配置，无法发起挑战。"
+            parsed_side = self._parse_side(side)
+            bot, error = await self._find_bot(opponent)
+            if error or not bot:
+                return error or "没找到对手。"
+            return await self._challenge_bot(bot, parsed_side)
+        except Exception as exc:  # noqa: BLE001
+            return f"挑战失败：{exc}"
+
+    async def _llm_tool_pending_challenges(self) -> str:
+        try:
+            lines = self._pending_challenge_lines()
+            if not lines:
+                return "当前没有待确认挑战。"
+            return "待确认挑战：\n" + "\n".join(lines[:8])
+        except Exception as exc:  # noqa: BLE001
+            return f"查询待确认失败：{exc}"
+
+    async def _llm_tool_owner_decision(self, challenge_id: str = "", decision: str = "accept", reason: str = "") -> str:
+        try:
+            if not self.llm_tools_allow_actions:
+                return "LLM 工具操作权限未开启：只能查询，不能同意/拒绝挑战。"
+            decision = str(decision or "accept").strip().lower()
+            if decision not in {"accept", "reject"}:
+                return "decision 只能是 accept 或 reject。"
+            cid = str(challenge_id or self._latest_pending_challenge_id()).strip()
+            if not cid:
+                return "当前没有待确认挑战。"
+            clean_reason = str(reason or "").strip()[:120]
+            data = await self._submit_owner_decision(cid, decision, reason=clean_reason if decision == "reject" else "")
+            self.pending_owner_challenges.pop(cid, None)
+            if decision == "accept":
+                self.state.accepted_challenges += 1
+            return self._format_owner_decision_result(cid, decision, data)
+        except Exception as exc:  # noqa: BLE001
+            return f"处理挑战决定失败：{exc}"
 
     def _normalize_challenge_decision_mode(self, value: Any) -> str:
         """兼容旧 auto_accept_challenges：未显式配置新模式时按旧布尔值映射。"""

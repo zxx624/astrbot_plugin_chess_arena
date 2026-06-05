@@ -18,6 +18,7 @@ AstrBot 棋擂台 Arena 客户端插件。它把一个 AstrBot 实例接入 **�
 - **LLM 台词**：走棋时可调用 AstrBot 当前模型/指定 Provider 生成简短拟人台词；失败时使用本地模板，不影响走棋。
 - **日志降噪**：默认把 SSE/事件/选步/提交走法等日常日志降到 DEBUG；需要排查时打开 `verbose_logging`。
 - **QQ/聊天命令**：支持查看状态、检查在线、手动发起挑战。
+- **LLM Tools（v3.4.0）**：允许对话模型以工具方式查询状态/找对手/发起挑战/审批待确认挑战，默认不暴露完整 token。
 
 ## 安装
 
@@ -85,6 +86,8 @@ AstrBot/
 | `commentary_timeout_sec` | int | `8` | LLM 台词生成超时秒数；超时不影响走棋。 |
 | `llm_provider_mode` | string | `default` | `default` 使用 AstrBot 当前默认对话模型；`custom` 使用手动 Provider ID。 |
 | `llm_provider_id` | string | 空 | 手动指定 AstrBot Provider ID，仅 `custom` 模式生效。不可用时自动回退默认模型。 |
+| `llm_tools_enabled` | bool | `true` | 是否向 AstrBot 对话模型注册棋擂台 LLM Tools。 |
+| `llm_tools_allow_actions` | bool | `false` | 是否允许 LLM Tools 执行会改变状态的操作：发起挑战、同意/拒绝挑战。关闭时仅允许查询类工具。 |
 | `auto_accept_challenges` | bool | `true` | 旧兼容项；未显式设置 `challenge_decision_mode` 时，`true` 等价于 `auto_accept`，`false` 等价于 `ignore`。 |
 | `challenge_decision_mode` | string | `auto_accept` | 收到挑战后的处理方式：`auto_accept` 自动同意；`owner_approve` 先等主人确认；`ignore` 只记录不处理。 |
 | `owner_notify_enabled` | bool | `true` | `owner_approve` 模式下是否尝试主动发送主人审批提醒。 |
@@ -191,6 +194,25 @@ LLM 只用于生成走棋台词，不参与棋力决策。
 - LLM 超时、报错、空输出时，会使用本地事实模板台词。
 - 插件会尽量根据当前走法事实生成台词，避免没吃子却说“白赚”、没将军却说“将军”。
 
+## LLM Tools（v3.4.0）
+
+插件启动时会按配置向 AstrBot 对话模型注册棋擂台工具。默认 `llm_tools_enabled=true`，但 `llm_tools_allow_actions=false`，也就是模型只能查询，不能擅自发起挑战或审批挑战。
+
+| 工具名 | 类型 | 参数 | 行为 |
+|---|---|---|---|
+| `chess_arena_status` | 查询 | 无 | 返回连接状态、Bot 名、平台、引擎链、待确认数量。 |
+| `chess_arena_find_bots` | 查询 | `query(string)` | 搜索/列出可挑战 Bot，最多返回 8 个摘要。 |
+| `chess_arena_pending_challenges` | 查询 | 无 | 返回本地等待主人审批的挑战列表。 |
+| `chess_arena_challenge` | 操作 | `opponent(string)`、`side(string)` | 按名字或 bot_id 发起挑战；需 `llm_tools_allow_actions=true`。 |
+| `chess_arena_owner_decision` | 操作 | `challenge_id(string)`、`decision(string)`、`reason(string)` | 同意/拒绝待确认挑战；需 `llm_tools_allow_actions=true`。 |
+
+安全约束：
+
+- 工具注册失败只记录 warning，不影响 SSE、走棋、命令。
+- 查询类工具不会返回完整 token；工具结果会做 token 脱敏和长度限制。
+- 操作类工具默认关闭，确认当前模型工具调用可靠后再开启 `llm_tools_allow_actions=true`。
+- `owner_decision` 不传 `challenge_id` 时默认处理最新一条待确认挑战。
+
 ## 日志说明
 
 从 `v3.2.2` 开始，插件默认减少 INFO 日志。
@@ -251,6 +273,7 @@ LLM 只用于生成走棋台词，不参与棋力决策。
 - `/api/bots/me` 返回 `401/403/404`：认为 token 无效。
 - 网络异常、超时、HTTP 5xx：不判定 token 无效，会保留 token 并稍后重试。
 - 日志只输出 token 前后少量字符，不输出完整 token。
+- LLM Tools 也只能返回 token 状态/脱敏提示，不应把完整 token 放入工具结果让模型看到。
 
 ## 本地 xqwlight 引擎
 
@@ -420,6 +443,7 @@ grep -RInE '(sk-<token-pattern>|AKID<secret-id-pattern>|<server-password>|<api-t
 
 ## 版本历史
 
+- **3.4.0** — 新增棋擂台 LLM Tools：状态、找对手、挑战、待确认、主人审批，并增加操作类工具开关。
 - **3.3.0** — 主人审批挑战流程、待确认/同意/拒绝命令、按名字挑战/找对手/当前/最近查询命令。
 - **3.2.4** — 修复挑战/走棋提交使用备用平台地址；配置页移除旧 `xqwlight` 选项但保留兼容映射。
 - **3.2.3** — 补全 README：安装、配置归属、引擎链、自定义引擎、LLM 台词、日志、排错和发布检查说明。
