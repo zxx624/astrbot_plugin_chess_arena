@@ -16,28 +16,11 @@ from typing import Any
 from urllib.parse import quote
 
 import aiohttp
+import hashlib
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.message_components import Plain
 from astrbot.api.star import Context, Star
-
-try:  # AstrBot 新版优先从 astrbot.api 暴露 FunctionTool。
-    from astrbot.api import FunctionTool as AstrFunctionTool
-except Exception:  # noqa: BLE001 - 不同 AstrBot 版本可能没有该导出
-    AstrFunctionTool = None
-
-try:  # 兼容部分 AstrBot 版本的底层工具类型。
-    from astrbot.api import ToolExecResult as AstrToolExecResult
-except Exception:  # noqa: BLE001
-    AstrToolExecResult = None
-
-try:
-    from pydantic import Field
-    from pydantic.dataclasses import dataclass as pydantic_dataclass
-except Exception:  # noqa: BLE001 - 注册 LLM 工具失败不能影响插件启动
-    Field = None
-    pydantic_dataclass = None
-
 
 @dataclass
 class ArenaState:
@@ -49,13 +32,65 @@ class ArenaState:
     submitted_moves: int = 0
 
 
+@dataclass
+class CardRoomDecisionSession:
+    """CardRoom 斗地主 LLM 上下文决策会话（进程内，不持久化）。"""
+    room_id: str = ""
+    seat: str = ""
+    last_state_hash: str = ""
+    turn_count: int = 0
+    history_summary: list[str] = __import__("dataclasses").field(default_factory=list)
+    persona: str = ""
+    last_errors: list[str] = __import__("dataclasses").field(default_factory=list)
+    created_at: float = 0.0
+    updated_at: float = 0.0
+
+    def key(self) -> str:
+        return f"{self.room_id}:{self.seat}"
+
+
 class ChessArenaPlugin(Star):
     """AstrBot 棋擂台客户端：自动注册、SSE 接入、自动接挑战、合法走法和台词。"""
+
+    # ── CardRoom LLM decision ──────────────────────────────────────────────
+    _CARDROOM_DECISION_SESSION_PROMPT: str = (
+        "你是一个斗地主 Bot，参与了三人 CardRoom 牌局。\n"
+        "- 你只能看到自己的手牌和其他人的手牌数量，不能猜测对手具体手牌。\n"
+        "- 你只能从 legal-actions 候选列表中选择出牌或 pass。\n"
+        "- 输出严格 JSON 格式，包含 action/cards/reason/speech 字段。\n"
+        "- 每次必须给出 reason 和 speech。\n"
+        "- 优先保留炸弹和火箭，除非必走。\n"
+        "- 如果能 pass 且不值得出牌，就 pass。"
+    )
+    # ────────────────────────────────────────────────────────────────────────
 
     def __init__(self, context: Context, config: dict | None = None):
         super().__init__(context)
         self.config = config or {}
         self.arena_base = str(self.config.get("arena_base") or "https://gulu624.icu").rstrip("/")
+        self.card_arena_base = str(
+            self.config.get("cardroom_base_url")
+            or self.config.get("card_arena_base")
+            or "http://127.0.0.1:8787"
+        ).rstrip("/")
+        self.cardroom_enabled = self._config_bool(self.config.get("cardroom_enabled"), default=False)
+        self.cardroom_poll_interval = max(1.0, float(self.config.get("cardroom_poll_interval") or 5))
+        self.cardroom_prompt_decision_enabled = self._config_bool(self.config.get("cardroom_prompt_decision_enabled"), default=True)
+        self.cardroom_prompt_max_retries = max(0, min(5, int(self.config.get("cardroom_prompt_max_retries") or 5)))
+        self.cardroom_seats = self._parse_cardroom_seats(self.config.get("cardroom_seats"))
+
+        # CardRoom LLM decision (default OFF -> min-legal)
+        self.cardroom_llm_decision_enabled = self._config_bool(self.config.get("cardroom_llm_decision_enabled"), default=False)
+        self.cardroom_context_enabled = self._config_bool(self.config.get("cardroom_context_enabled"), default=True)
+        self.cardroom_context_max_history = max(1, int(self.config.get("cardroom_context_max_history") or 6))
+        self.cardroom_persona_prompt = str(self.config.get("cardroom_persona_prompt") or "你是斗地主 Bot。出牌自然、有一点胜负欲。").strip()
+
+        # Go9 engine adapter (default OFF -> current random/pass fallback)
+        self.go_engine_enabled = self._config_bool(self.config.get("go_engine_enabled"), default=False)
+        self.go_engine_endpoint = str(self.config.get("go_engine_endpoint") or "http://127.0.0.1:8787/api/go9/analyze").strip()
+        self.go_engine_timeout_sec = max(1.0, float(self.config.get("go_engine_timeout_sec") or 5))
+        self.go_engine_fallback_random = self._config_bool(self.config.get("go_engine_fallback_random"), default=True)
+
         self.arena_fallback_bases = self._parse_fallback_bases(self.config.get("arena_fallback_bases"))
         self.token = str(self.config.get("token") or "").strip()
         self.auto_register = bool(self.config.get("auto_register", True))
@@ -74,6 +109,10 @@ class ChessArenaPlugin(Star):
         self.llm_provider_id = str(self.config.get("llm_provider_id") or "").strip()
         self.llm_tools_enabled = self._config_bool(self.config.get("llm_tools_enabled"), default=True)
         self.llm_tools_allow_actions = self._config_bool(self.config.get("llm_tools_allow_actions"), default=False)
+        self.enabled_games = self._parse_enabled_games(self.config.get("enabled_games"))
+        self.default_game = self._normalize_game(self.config.get("default_game"))
+        if self.default_game not in self.enabled_games:
+            self.enabled_games.insert(0, self.default_game)
         self.auto_accept_challenges = bool(self.config.get("auto_accept_challenges", True))
         self.challenge_decision_mode = self._normalize_challenge_decision_mode(self.config.get("challenge_decision_mode"))
         self.server_challenge_policy = self._server_challenge_policy_for_mode(self.challenge_decision_mode)
@@ -82,6 +121,11 @@ class ChessArenaPlugin(Star):
         self.owner_decision_timeout_sec = max(1, int(self.config.get("owner_decision_timeout_sec") or 180))
         self.match_report_enabled = self._config_bool(self.config.get("match_report_enabled"), default=True)
         self.pending_owner_challenges: dict[str, dict[str, Any]] = {}
+        self.active_matches: dict[str, dict[str, Any]] = {}
+        self.recent_finished_matches: list[dict[str, Any]] = []
+        self.notified_challenges: set[str] = set()
+        self.finished_games: set[str] = set()
+        self._notify_tasks: set[asyncio.Task] = set()
         self.engine_mode = self._normalize_engine_mode(self.config.get("engine_mode") or "auto")
         self.engine_depth = int(self.config.get("engine_depth") or 3)
         self.engine_timeout_sec = max(1, int(self.config.get("engine_timeout_sec") or 8))
@@ -94,14 +138,12 @@ class ChessArenaPlugin(Star):
         self.verbose_logging = self._config_bool(self.config.get("verbose_logging"), default=False)
 
         self.state = ArenaState()
+        self._cardroom_sessions: dict[str, CardRoomDecisionSession] = {}
         self._session: aiohttp.ClientSession | None = None
         self._sse_task: asyncio.Task | None = None
+        self._cardroom_task: asyncio.Task | None = None
         self._startup_task: asyncio.Task | None = None
         self._stopping = asyncio.Event()
-        self._llm_tools_registered = False
-
-        if self.llm_tools_enabled:
-            self._register_llm_tools_safe()
 
         self._startup_task = asyncio.create_task(self._startup(), name="chess_arena_startup")
 
@@ -125,6 +167,8 @@ class ChessArenaPlugin(Star):
 
             self._routine_log("[ChessArena] 已读取网站端 profile；Bot 资料统一由网站管理，插件端不覆盖。")
             self._sse_task = asyncio.create_task(self._sse_loop(), name="chess_arena_sse_loop")
+            if self.cardroom_enabled:
+                self._cardroom_task = asyncio.create_task(self._cardroom_poll_loop(), name="chess_arena_cardroom_poll_loop")
             self._routine_log(
                 "[ChessArena] SSE 客户端已启动: %s bot=%s token=%s",
                 self.arena_base,
@@ -172,6 +216,93 @@ class ChessArenaPlugin(Star):
         return bases
 
     @staticmethod
+    def _parse_cardroom_seats(value: Any) -> list[dict[str, Any]]:
+        if value in (None, ""):
+            return []
+        if isinstance(value, str):
+            try:
+                raw = json.loads(value)
+            except json.JSONDecodeError:
+                raw = []
+        else:
+            raw = value
+        if isinstance(raw, dict):
+            raw = [raw]
+        seats: list[dict[str, Any]] = []
+        if isinstance(raw, list):
+            for item in raw:
+                if not isinstance(item, dict):
+                    continue
+                room_id = str(item.get("room_id") or "").strip()
+                seat = str(item.get("seat") if item.get("seat") is not None else "").strip()
+                token = str(item.get("token") or "").strip()
+                if room_id and seat:
+                    seats.append({"room_id": room_id, "seat": seat, "token": token})
+        return seats
+
+    _LEGAL_GAMES = {"xiangqi", "go"}
+    _GAME_ALIASES = {
+        "xiangqi": "xiangqi",
+        "象棋": "xiangqi",
+        "中国象棋": "xiangqi",
+        "chess": "xiangqi",
+        "go": "go",
+        "围棋": "go",
+        "围棋9路": "go",
+        "9路围棋": "go",
+    }
+
+    @classmethod
+    def _game_alias_to_id(cls, value: Any) -> str:
+        text = str(value or "").strip().lower()
+        if not text:
+            return ""
+        return cls._GAME_ALIASES.get(text, text if text in cls._LEGAL_GAMES else "")
+
+    def _parse_enabled_games(self, value: Any) -> list[str]:
+        if value is None or value == "":
+            raw_items: list[Any] = []
+        elif isinstance(value, str):
+            text = value.strip()
+            raw_items = []
+            if text.startswith("["):
+                try:
+                    parsed = json.loads(text)
+                    if isinstance(parsed, list):
+                        raw_items = parsed
+                except json.JSONDecodeError:
+                    raw_items = []
+            if not raw_items:
+                raw_items = text.replace("\n", ",").replace("，", ",").replace(";", ",").replace("；", ",").split(",")
+        elif isinstance(value, (list, tuple, set)):
+            raw_items = list(value)
+        else:
+            raw_items = []
+
+        games: list[str] = []
+        for item in raw_items:
+            game = self._game_alias_to_id(item)
+            if game and game not in games:
+                games.append(game)
+        if "xiangqi" not in games:
+            games.append("xiangqi")
+        return games
+
+    def _normalize_game(self, value: Any = None) -> str:
+        raw = value
+        if raw is None or str(raw).strip() == "":
+            raw = getattr(self, "default_game", "xiangqi")
+        game = self._game_alias_to_id(raw)
+        enabled_games = list(getattr(self, "enabled_games", []) or [])
+        if game and game in enabled_games:
+            return game
+
+        fallback = self._game_alias_to_id(getattr(self, "default_game", "xiangqi"))
+        if fallback and fallback in enabled_games:
+            return fallback
+        return "xiangqi"
+
+    @staticmethod
     def _config_bool(value: Any, *, default: bool = False) -> bool:
         if value is None or value == "":
             return default
@@ -193,192 +324,170 @@ class ChessArenaPlugin(Star):
         else:
             logger.debug(message, *args)
 
-    def _register_llm_tools_safe(self) -> None:
-        """向 AstrBot 默认聊天模型注册棋擂台工具；任何失败都只记录 warning。"""
-        try:
-            registrar = getattr(self.context, "add_llm_tools", None)
-            if not callable(registrar):
-                logger.warning("[ChessArena] 当前 AstrBot Context 不支持 add_llm_tools，跳过棋擂台 LLM 工具注册。")
-                return
+    def _llm_tools_disabled_message(self) -> str:
+        return "棋擂台 LLM 工具未启用：请在插件配置 llm_tools_enabled 开启。"
 
-            function_tool_cls, tool_exec_result_cls = self._llm_tool_classes()
-            if function_tool_cls is None:
-                logger.warning("[ChessArena] 当前 AstrBot 版本未提供 FunctionTool，跳过棋擂台 LLM 工具注册。")
-                return
+    @filter.llm_tool(name="chess_arena_status")
+    async def chess_arena_status(self, event: AstrMessageEvent) -> str:
+        """查看棋擂台连接状态、Bot、平台、引擎链和待确认挑战数量。
 
-            tools = [
-                self._build_llm_function_tool(
-                    function_tool_cls,
-                    tool_exec_result_cls,
-                    "chess_arena_status",
-                    "查看棋擂台连接状态、Bot、平台、引擎链和待确认挑战数量。",
-                    self._llm_tool_status,
-                    self._tool_parameters({}),
-                ),
-                self._build_llm_function_tool(
-                    function_tool_cls,
-                    tool_exec_result_cls,
-                    "chess_arena_find_bots",
-                    "查询或列出可挑战的棋擂台 Bot，最多返回 8 个。",
-                    self._llm_tool_find_bots,
-                    self._tool_parameters(
-                        {
-                            "query": {"type": "string", "description": "Bot 名称或 bot_id 关键词；空则列出可见 Bot。"},
-                        }
-                    ),
-                ),
-                self._build_llm_function_tool(
-                    function_tool_cls,
-                    tool_exec_result_cls,
-                    "chess_arena_challenge",
-                    "按名字或 bot_id 向棋擂台 Bot 发起挑战。",
-                    self._llm_tool_challenge,
-                    self._tool_parameters(
-                        {
-                            "opponent": {"type": "string", "description": "对手 Bot 名称或 bot_id。"},
-                            "side": {"type": "string", "description": "我方执红/黑/随机；允许 red、black、random、红、黑。"},
-                        },
-                        required=["opponent"],
-                    ),
-                ),
-                self._build_llm_function_tool(
-                    function_tool_cls,
-                    tool_exec_result_cls,
-                    "chess_arena_pending_challenges",
-                    "列出等待主人审批的棋擂台挑战。",
-                    self._llm_tool_pending_challenges,
-                    self._tool_parameters({}),
-                ),
-                self._build_llm_function_tool(
-                    function_tool_cls,
-                    tool_exec_result_cls,
-                    "chess_arena_owner_decision",
-                    "同意或拒绝一条等待主人审批的棋擂台挑战；不传 challenge_id 时处理最新一条。",
-                    self._llm_tool_owner_decision,
-                    self._tool_parameters(
-                        {
-                            "challenge_id": {"type": "string", "description": "挑战 ID；为空时默认最新一条待确认。"},
-                            "decision": {"type": "string", "description": "只能是 accept 或 reject。"},
-                            "reason": {"type": "string", "description": "拒绝原因，可为空；不要包含隐私或凭据。"},
-                        },
-                    ),
-                ),
-            ]
-            self._call_add_llm_tools(registrar, tools)
-            self._llm_tools_registered = True
-            self._routine_log("[ChessArena] 已注册棋擂台 LLM 工具: %s", ", ".join(getattr(tool, "name", "") for tool in tools))
-        except Exception as exc:  # noqa: BLE001 - LLM 工具不可影响插件启动/SSE/自动走棋
-            logger.warning("[ChessArena] 注册棋擂台 LLM 工具失败，已跳过: %s", exc)
+        Args:
+        """
+        if not self.llm_tools_enabled:
+            return self._llm_tools_disabled_message()
+        return await self._llm_tool_status()
 
-    @staticmethod
-    def _tool_parameters(properties: dict[str, Any], required: list[str] | None = None) -> dict[str, Any]:
-        return {"type": "object", "properties": properties, "required": required or []}
+    @filter.llm_tool(name="chess_arena_find_bots")
+    async def chess_arena_find_bots(self, event: AstrMessageEvent, query: str = "", game: str = "") -> str:
+        """查询或列出可挑战的棋擂台 Bot，最多返回 8 个。
 
-    @staticmethod
-    def _llm_tool_classes() -> tuple[Any, Any]:
-        function_tool_cls = AstrFunctionTool
-        tool_exec_result_cls = AstrToolExecResult
-        if function_tool_cls is None:
-            try:
-                from astrbot.core.agent.tool import FunctionTool as CoreFunctionTool  # type: ignore
-                from astrbot.core.agent.tool import ToolExecResult as CoreToolExecResult  # type: ignore
+        Args:
+            query(string): Bot 名称或 bot_id 关键词；空则列出可见 Bot。
+            game(string): 游戏类型；默认 xiangqi，可选 xiangqi/go/围棋。只接受当前平台已接入的双人棋类。
+        """
+        if not self.llm_tools_enabled:
+            return self._llm_tools_disabled_message()
+        return await self._llm_tool_find_bots(query=query, game=game)
 
-                function_tool_cls = CoreFunctionTool
-                tool_exec_result_cls = tool_exec_result_cls or CoreToolExecResult
-            except Exception:  # noqa: BLE001
-                return None, tool_exec_result_cls
-        elif tool_exec_result_cls is None:
-            try:
-                from astrbot.core.agent.tool import ToolExecResult as CoreToolExecResult  # type: ignore
+    @filter.llm_tool(name="chess_arena_challenge")
+    async def chess_arena_challenge(self, event: AstrMessageEvent, opponent: str, side: str = "random", game: str = "") -> str:
+        """按名字或 bot_id 向棋擂台 Bot 发起挑战。
 
-                tool_exec_result_cls = CoreToolExecResult
-            except Exception:  # noqa: BLE001
-                pass
-        return function_tool_cls, tool_exec_result_cls
+        Args:
+            opponent(string): 对手 Bot 名称或 bot_id。
+            side(string): 我方执红/黑/随机；允许 red、black、random、红、黑。
+            game(string): 游戏类型；默认 xiangqi，可选 xiangqi/go/围棋。斗地主不是双人棋类，不能用这个工具发起。
+        """
+        if not self.llm_tools_enabled:
+            return self._llm_tools_disabled_message()
+        return await self._llm_tool_challenge(opponent=opponent, side=side, game=game)
 
-    def _build_llm_function_tool(
+    @filter.llm_tool(name="chess_arena_pending_challenges")
+    async def chess_arena_pending_challenges(self, event: AstrMessageEvent) -> str:
+        """列出等待主人审批的棋擂台挑战。
+
+        Args:
+        """
+        if not self.llm_tools_enabled:
+            return self._llm_tools_disabled_message()
+        return await self._llm_tool_pending_challenges()
+
+    @filter.llm_tool(name="chess_arena_owner_decision")
+    async def chess_arena_owner_decision(
         self,
-        function_tool_cls: Any,
-        tool_exec_result_cls: Any,
-        name: str,
-        description: str,
-        handler: Any,
-        parameters: dict[str, Any],
-    ) -> Any:
-        async def callback(*args: Any, **kwargs: Any) -> Any:
-            kwargs.pop("ctx", None)
-            kwargs.pop("context", None)
-            return self._llm_tool_result(await handler(**kwargs), tool_exec_result_cls)
+        event: AstrMessageEvent,
+        decision: str,
+        challenge_id: str = "",
+        reason: str = "",
+    ) -> str:
+        """同意或拒绝一条等待主人审批的棋擂台挑战；不传 challenge_id 时处理最新一条。
 
-        constructors = [
-            lambda: function_tool_cls(name=name, description=description, parameters=parameters, func=callback),
-            lambda: function_tool_cls(name=name, description=description, parameters=parameters, handler=callback),
-            lambda: function_tool_cls(name=name, desc=description, parameters=parameters, func=callback),
-            lambda: function_tool_cls(callback, name=name, description=description, parameters=parameters),
-            lambda: function_tool_cls(name, description, parameters, callback),
-        ]
-        for factory_name in ("from_callable", "from_function", "from_func"):
-            factory = getattr(function_tool_cls, factory_name, None)
-            if callable(factory):
-                constructors.append(lambda factory=factory: factory(callback, name=name, description=description, parameters=parameters))
-        for constructor in constructors:
-            try:
-                return constructor()
-            except Exception:  # noqa: BLE001 - 尝试其它 AstrBot 版本的构造方式
-                continue
+        Args:
+            decision(string): 只能是 accept 或 reject；必须显式传入，避免误同意挑战。
+            challenge_id(string): 挑战 ID；为空时默认最新一条待确认。
+            reason(string): 拒绝原因，可为空；不要包含隐私或凭据。
+        """
+        if not self.llm_tools_enabled:
+            return self._llm_tools_disabled_message()
+        return await self._llm_tool_owner_decision(challenge_id=challenge_id, decision=decision, reason=reason)
 
-        if pydantic_dataclass is not None and Field is not None:
-            plugin = self
+    @filter.llm_tool(name="card_arena_create_room")
+    async def card_arena_create_room(self, event: AstrMessageEvent, seed: int = 0, landlord_index: int = 0) -> str:
+        """在 9191 沙箱创建一个 CardRoom 斗地主房间；这是三人扑克房间，不是 8787 正式服棋类 Match。
 
-            @pydantic_dataclass
-            class ChessArenaLLMTool(function_tool_cls):  # type: ignore[misc, valid-type]
-                name: str = ""
-                description: str = ""
-                parameters: dict[str, Any] = Field(default_factory=dict)
-                handler: Any = Field(default=None, repr=False)
-                plugin: Any = Field(default=plugin, repr=False)
-                result_cls: Any = Field(default=tool_exec_result_cls, repr=False)
+        Args:
+            seed(number): 可选随机种子；0 表示后端随机。
+            landlord_index(number): 地主座位，0/1/2，默认 0。
+        """
+        if not self.llm_tools_enabled:
+            return self._llm_tools_disabled_message()
+        return await self._card_tool_create_room(seed=seed, landlord_index=landlord_index)
 
-                async def run(self, ctx: Any = None, **kwargs: Any) -> Any:  # noqa: ANN001
-                    result = self.handler(**kwargs)
-                    if inspect.isawaitable(result):
-                        result = await result
-                    return self.plugin._llm_tool_result(result, self.result_cls)
+    @filter.llm_tool(name="card_arena_get_room")
+    async def card_arena_get_room(self, event: AstrMessageEvent, room_id: str, seat: str = "0") -> str:
+        """按指定 seat 查看 9191 CardRoom 斗地主房间的 LLM 视角；只返回自己的手牌和其他人的手牌数量。
 
-            return ChessArenaLLMTool(name=name, description=description, parameters=parameters, handler=handler)
+        Args:
+            room_id(string): CardRoom 房间 ID。
+            seat(string): 座位 0/1/2 或 seat0/seat1/seat2；只能看到该 seat 的视角。
+        """
+        if not self.llm_tools_enabled:
+            return self._llm_tools_disabled_message()
+        return await self._card_tool_get_room(room_id=room_id, seat=seat)
 
-        raise RuntimeError(f"cannot construct FunctionTool {name}")
+    @filter.llm_tool(name="card_arena_get_legal_actions")
+    async def card_arena_get_legal_actions(self, event: AstrMessageEvent, room_id: str, seat: str = "0") -> str:
+        """查询 9191 CardRoom 斗地主当前 seat 的合法动作摘要，供 LLM 判断出牌或 pass。
 
-    def _call_add_llm_tools(self, registrar: Any, tools: list[Any]) -> None:
-        try:
-            signature = inspect.signature(registrar)
-            params = list(signature.parameters.values())
-            use_varargs = any(param.kind == inspect.Parameter.VAR_POSITIONAL for param in params)
-        except Exception:  # noqa: BLE001
-            use_varargs = False
-        calls = [lambda: registrar(*tools), lambda: registrar(tools)] if use_varargs else [lambda: registrar(tools), lambda: registrar(*tools)]
-        last_error = ""
-        for call in calls:
-            try:
-                result = call()
-                if inspect.isawaitable(result):
-                    try:
-                        loop = asyncio.get_running_loop()
-                        task = loop.create_task(result, name="chess_arena_add_llm_tools")
-                        task.add_done_callback(self._log_add_llm_tools_task_result)
-                    except RuntimeError:
-                        logger.warning("[ChessArena] add_llm_tools 返回 awaitable，但当前无运行事件循环；已跳过等待。")
-                return
-            except Exception as exc:  # noqa: BLE001
-                last_error = str(exc)
-        raise RuntimeError(last_error or "add_llm_tools call failed")
+        Args:
+            room_id(string): CardRoom 房间 ID。
+            seat(string): 座位 0/1/2 或 seat0/seat1/seat2。
+        """
+        if not self.llm_tools_enabled:
+            return self._llm_tools_disabled_message()
+        return await self._card_tool_get_legal_actions(room_id=room_id, seat=seat)
 
-    @staticmethod
-    def _log_add_llm_tools_task_result(task: asyncio.Task) -> None:
-        try:
-            task.result()
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("[ChessArena] 异步注册棋擂台 LLM 工具失败，已跳过: %s", exc)
+    @filter.llm_tool(name="card_arena_play")
+    async def card_arena_play(self, event: AstrMessageEvent, room_id: str, seat: str, cards: str, reason: str = "") -> str:
+        """向 9191 CardRoom 斗地主裁判提交出牌；后端会审查规则，非法时返回 code/message/legal_hint/attempt，LLM 最多重试 5 次。
+
+        Args:
+            room_id(string): CardRoom 房间 ID。
+            seat(string): 座位 0/1/2 或 seat0/seat1/seat2。
+            cards(string): 要出的牌，逗号或空格分隔，例如 "9S,9H"。必须来自该 seat 的 my_hand。
+            reason(string): 简短出牌理由，会记录到 action_history。
+        """
+        if not self.llm_tools_enabled:
+            return self._llm_tools_disabled_message()
+        if not self.llm_tools_allow_actions:
+            return "LLM 工具操作权限未开启：只能查询，不能提交斗地主出牌。"
+        return await self._card_tool_play(room_id=room_id, seat=seat, cards=cards, reason=reason)
+
+    @filter.llm_tool(name="card_arena_pass")
+    async def card_arena_pass(self, event: AstrMessageEvent, room_id: str, seat: str, reason: str = "") -> str:
+        """向 9191 CardRoom 斗地主裁判提交 pass；新一轮不能 pass，非法时返回结构化错误。
+
+        Args:
+            room_id(string): CardRoom 房间 ID。
+            seat(string): 座位 0/1/2 或 seat0/seat1/seat2。
+            reason(string): 简短 pass 理由，会记录到 action_history。
+        """
+        if not self.llm_tools_enabled:
+            return self._llm_tools_disabled_message()
+        if not self.llm_tools_allow_actions:
+            return "LLM 工具操作权限未开启：只能查询，不能提交斗地主 pass。"
+        return await self._card_tool_pass(room_id=room_id, seat=seat, reason=reason)
+
+    @filter.llm_tool(name="card_arena_prompt_decision")
+    async def card_arena_prompt_decision(
+        self,
+        event: AstrMessageEvent,
+        room_id: str,
+        seat: str = "0",
+        action: str = "",
+        cards: str = "",
+        speech: str = "",
+        reason: str = "",
+    ) -> str:
+        """提交一次斗地主 Prompt 决策；网站端会先按 private view/legal-actions 审核，非法最多重试/回退。
+
+        Args:
+            room_id(string): CardRoom 房间 ID。
+            seat(string): 座位 0/1/2 或 seat0/seat1/seat2。
+            action(string): play 或 pass。为空时插件从 legal-actions 选最小合法动作。
+            cards(string): action=play 时的牌，逗号或空格分隔。
+            speech(string): Bot 台词，写入 action_history，最长 300 字。
+            reason(string): 简短决策理由。
+        """
+        if not self.llm_tools_enabled:
+            return self._llm_tools_disabled_message()
+        if not self.llm_tools_allow_actions:
+            return "LLM 工具操作权限未开启：只能查询，不能提交斗地主 Prompt 决策。"
+        return await self._card_tool_prompt_decision(room_id=room_id, seat=seat, action=action, cards=cards, speech=speech, reason=reason)
+
+    def _register_llm_tools_safe(self) -> None:
+        """兼容旧调用点：LLM 工具由 @filter.llm_tool 标准装饰器注册。"""
+        return None
 
     def _llm_tool_result(self, value: Any, tool_exec_result_cls: Any = None) -> Any:
         text = self._safe_llm_tool_text(value)
@@ -404,34 +513,40 @@ class ChessArenaPlugin(Star):
             status = "在线" if self.state.connected else "离线"
             pending_count = len(self._pending_challenge_lines())
             engine_chain = " -> ".join(self._engine_chain())
+            active_lines = self._active_match_lines()
+            recent_line = self._latest_finished_match_line()
             return (
                 f"连接：{status}\n"
                 f"Bot：{self.effective_bot_name}\n"
                 f"平台：{self.arena_base}\n"
                 f"引擎链：{engine_chain}\n"
-                f"待确认：{pending_count}"
+                f"待确认：{pending_count}\n"
+                f"进行中：{len(active_lines)}"
+                + (("\n" + "\n".join(active_lines[:3])) if active_lines else "")
+                + (("\n最近结束：" + recent_line) if recent_line else "")
             )
         except Exception as exc:  # noqa: BLE001
             return f"查询状态失败：{exc}"
 
-    async def _llm_tool_find_bots(self, query: str = "") -> str:
+    async def _llm_tool_find_bots(self, query: str = "", game: str = "") -> str:
         try:
-            bots = [bot for bot in await self._fetch_bots(str(query or "").strip()) if not self._is_self_bot(bot)]
+            normalized_game = self._normalize_game(game)
+            bots = [bot for bot in await self._fetch_bots(str(query or "").strip(), game=normalized_game) if not self._is_self_bot(bot)]
             bots = sorted(bots, key=self._bot_priority, reverse=True)[:8]
             if not bots:
-                return "未找到可列出的 Bot。"
+                return f"未找到可列出的 Bot（game={normalized_game}）。"
             lines = []
             for bot in bots:
                 name = self._bot_name(bot) or "未命名"
                 bot_id = self._bot_id(bot) or "未知ID"
-                online = "在线" if bool(bot.get("online", bot.get("is_online", False))) else "离线"
+                online = "在线" if self._bot_online(bot) else "离线"
                 available = "可用" if self._bot_available(bot) else "不可用"
                 lines.append(f"- {name} ({bot_id})：{online}/{available}")
-            return "可挑战 Bot：\n" + "\n".join(lines)
+            return f"可挑战 Bot（game={normalized_game}）：\n" + "\n".join(lines)
         except Exception as exc:  # noqa: BLE001
             return f"查询 Bot 失败：{exc}"
 
-    async def _llm_tool_challenge(self, opponent: str = "", side: str = "random") -> str:
+    async def _llm_tool_challenge(self, opponent: str = "", side: str = "random", game: str = "") -> str:
         try:
             if not self.llm_tools_allow_actions:
                 return "LLM 工具操作权限未开启：只能查询，不能发起挑战。"
@@ -440,11 +555,12 @@ class ChessArenaPlugin(Star):
                 return "请提供 opponent（名字或 bot_id）。"
             if not self.token:
                 return "Token 未配置，无法发起挑战。"
+            normalized_game = self._normalize_game(game)
             parsed_side = self._parse_side(side)
-            bot, error = await self._find_bot(opponent)
+            bot, error = await self._find_bot(opponent, game=normalized_game)
             if error or not bot:
                 return error or "没找到对手。"
-            return await self._challenge_bot(bot, parsed_side)
+            return await self._challenge_bot(bot, parsed_side, game=normalized_game)
         except Exception as exc:  # noqa: BLE001
             return f"挑战失败：{exc}"
 
@@ -457,13 +573,13 @@ class ChessArenaPlugin(Star):
         except Exception as exc:  # noqa: BLE001
             return f"查询待确认失败：{exc}"
 
-    async def _llm_tool_owner_decision(self, challenge_id: str = "", decision: str = "accept", reason: str = "") -> str:
+    async def _llm_tool_owner_decision(self, challenge_id: str = "", decision: str = "", reason: str = "") -> str:
         try:
             if not self.llm_tools_allow_actions:
                 return "LLM 工具操作权限未开启：只能查询，不能同意/拒绝挑战。"
-            decision = str(decision or "accept").strip().lower()
+            decision = str(decision or "").strip().lower()
             if decision not in {"accept", "reject"}:
-                return "decision 只能是 accept 或 reject。"
+                return "decision 必须显式填写 accept 或 reject。"
             cid = str(challenge_id or self._latest_pending_challenge_id()).strip()
             if not cid:
                 return "当前没有待确认挑战。"
@@ -543,6 +659,510 @@ class ChessArenaPlugin(Star):
             data = {}
         return base, status, data, text
 
+    async def _card_api_json(
+        self,
+        method: str,
+        path: str,
+        json_payload: dict[str, Any] | None = None,
+        timeout: aiohttp.ClientTimeout | None = None,
+    ) -> tuple[int, dict[str, Any] | list[Any], str]:
+        """Call CardRoom APIs only; never uses spectator for bot decisions."""
+        session = await self._get_session()
+        url = f"{self.card_arena_base}{path}"
+        async with session.request(method, url, json=json_payload, timeout=timeout or aiohttp.ClientTimeout(total=15)) as resp:
+            text = await resp.text()
+            try:
+                data = json.loads(text) if text else {}
+            except json.JSONDecodeError:
+                data = {}
+            return resp.status, data, text
+
+    @staticmethod
+    def _card_parse_seat(value: Any) -> str:
+        text = str(value if value is not None else "0").strip().lower()
+        if text.startswith("seat"):
+            text = text[4:]
+        if text not in {"0", "1", "2"}:
+            text = "0"
+        return text
+
+    @staticmethod
+    def _card_parse_cards(value: Any) -> list[str]:
+        if isinstance(value, list):
+            raw = value
+        else:
+            text = str(value or "").replace("，", ",").replace("、", ",").replace(";", ",")
+            raw = []
+            for chunk in text.split(","):
+                raw.extend(str(chunk).split())
+        return [str(card).strip().upper() for card in raw if str(card).strip()]
+
+    @staticmethod
+    def _card_json_text(data: Any, limit: int = 1800) -> str:
+        text = json.dumps(data, ensure_ascii=False, indent=2)
+        if len(text) > limit:
+            text = text[: limit - 1] + "…"
+        return text
+
+    @staticmethod
+    def _card_error_text(prefix: str, status: int, data: Any, raw_text: str) -> str:
+        detail = data.get("detail") if isinstance(data, dict) else None
+        if isinstance(detail, dict):
+            return (
+                f"{prefix}失败：HTTP {status}\n"
+                f"code={detail.get('code') or ''}\n"
+                f"message={detail.get('message') or ''}\n"
+                f"legal_hint={detail.get('legal_hint') or ''}\n"
+                f"attempt={json.dumps(detail.get('attempt') or {}, ensure_ascii=False)}\n"
+                "请重新读取 card_arena_get_room 和 card_arena_get_legal_actions 后再选择；非法最多重试 5 次。"
+            )
+        message = detail if detail is not None else raw_text[:300]
+        return f"{prefix}失败：HTTP {status} {message}"
+
+    def _cardroom_controller_identity(self) -> tuple[str, str]:
+        controller_id = self._my_bot_id() or self.effective_bot_name or self._token_hint(self.token) or "astrbot"
+        display_name = self.effective_bot_name or controller_id
+        return str(controller_id)[:160], str(display_name)[:80]
+
+    async def _card_tool_pool_status(self) -> str:
+        try:
+            status, data, text = await self._card_api_json("GET", "/api/card-rooms/pool")
+            if status >= 400:
+                return self._card_error_text("获取斗地主房间池", status, data, text)
+            slots = data.get("slots") if isinstance(data, dict) else data
+            if not isinstance(slots, list):
+                return "斗地主房间池：\n" + self._card_json_text(data)
+            lines = ["斗地主房间池（1-5）："]
+            for slot in slots:
+                if not isinstance(slot, dict):
+                    continue
+                seats = slot.get("seats") if isinstance(slot.get("seats"), list) else []
+                names: list[str] = []
+                for seat in seats:
+                    if isinstance(seat, dict):
+                        names.append(str(seat.get("display_name") or seat.get("controller_id") or f"seat{seat.get('seat', '')}"))
+                status_text = str(slot.get("status") or "waiting")
+                room_id = str(slot.get("room_id") or "")
+                suffix = f" room={room_id}" if room_id else ""
+                lines.append(f"{slot.get('slot')}: {status_text} {len(seats)}/3 {'、'.join(names) or '空'}{suffix}")
+            lines.append("命令：斗地主加入 <1-5> / 斗地主退出 <1-5> / 斗地主开始 <1-5> / 斗地主状态")
+            return "\n".join(lines)
+        except Exception as exc:  # noqa: BLE001
+            return f"获取斗地主房间池失败：{exc}"
+
+    async def _card_tool_pool_join(self, slot: Any) -> str:
+        try:
+            slot_num = max(1, min(5, int(str(slot or "1").strip())))
+            controller_id, display_name = self._cardroom_controller_identity()
+            payload = {"controller_type": "astrbot", "controller_id": controller_id, "display_name": display_name}
+            status, data, text = await self._card_api_json("POST", f"/api/card-rooms/pool/{slot_num}/join", json_payload=payload)
+            if status >= 400:
+                return self._card_error_text(f"加入斗地主房间 {slot_num}", status, data, text)
+            slot_data = data.get("slot") if isinstance(data, dict) and isinstance(data.get("slot"), dict) else data
+            msg = f"已加入斗地主房间 {slot_num}：{display_name}。"
+            if isinstance(slot_data, dict):
+                msg += f"\n状态：{slot_data.get('status')}，人数：{len(slot_data.get('seats') or [])}/3"
+                if slot_data.get("room_id"):
+                    msg += f"\n牌局：{slot_data.get('room_id')}"
+            return msg + "\n" + await self._card_tool_pool_status()
+        except Exception as exc:  # noqa: BLE001
+            return f"加入斗地主房间失败：{exc}"
+
+    async def _card_tool_pool_leave(self, slot: Any) -> str:
+        try:
+            slot_num = max(1, min(5, int(str(slot or "1").strip())))
+            controller_id, display_name = self._cardroom_controller_identity()
+            payload = {"controller_type": "astrbot", "controller_id": controller_id, "display_name": display_name}
+            status, data, text = await self._card_api_json("POST", f"/api/card-rooms/pool/{slot_num}/leave", json_payload=payload)
+            if status >= 400:
+                return self._card_error_text(f"退出斗地主房间 {slot_num}", status, data, text)
+            return f"已退出斗地主房间 {slot_num}。\n" + await self._card_tool_pool_status()
+        except Exception as exc:  # noqa: BLE001
+            return f"退出斗地主房间失败：{exc}"
+
+    async def _card_tool_pool_start(self, slot: Any) -> str:
+        try:
+            if not self.llm_tools_allow_actions:
+                return "斗地主开始需要先开启 llm_tools_allow_actions。"
+            slot_num = max(1, min(5, int(str(slot or "1").strip())))
+            status, data, text = await self._card_api_json("POST", f"/api/card-rooms/pool/{slot_num}/start", json_payload={})
+            if status >= 400:
+                return self._card_error_text(f"启动斗地主房间 {slot_num}", status, data, text)
+            slot_data = data.get("slot") if isinstance(data, dict) and isinstance(data.get("slot"), dict) else data
+            room_id = slot_data.get("room_id") if isinstance(slot_data, dict) else ""
+            return f"斗地主房间 {slot_num} 已启动。" + (f"\n牌局：{room_id}" if room_id else "")
+        except Exception as exc:  # noqa: BLE001
+            return f"启动斗地主房间失败：{exc}"
+
+    async def _card_tool_create_room(self, seed: int = 0, landlord_index: int = 0) -> str:
+        try:
+            if not self.llm_tools_allow_actions:
+                return "LLM 工具操作权限未开启：只能查询，不能创建斗地主房间。"
+            payload: dict[str, Any] = {"game": "doudizhu", "landlord_index": max(0, min(2, int(landlord_index or 0)))}
+            if int(seed or 0) != 0:
+                payload["seed"] = int(seed)
+            status, data, text = await self._card_api_json("POST", "/api/card-rooms", json_payload=payload)
+            if status >= 400:
+                return self._card_error_text("创建 CardRoom", status, data, text)
+            room_id = data.get("room_id") if isinstance(data, dict) else ""
+            return (
+                f"已在 9191 沙箱创建斗地主房间：{room_id}\n"
+                f"平台：{self.card_arena_base}\n"
+                "下一步用 card_arena_get_room(room_id, seat) 看自己的牌，再用 card_arena_get_legal_actions 判断。"
+            )
+        except Exception as exc:  # noqa: BLE001
+            return f"创建 CardRoom 失败：{exc}"
+
+    @staticmethod
+    def _append_cardroom_token(path: str, token: str | None) -> str:
+        token = str(token or "").strip()
+        if not token:
+            return path
+        sep = "&" if "?" in path else "?"
+        return f"{path}{sep}token={quote(token, safe='')}"
+
+    async def _card_tool_get_room(self, room_id: str, seat: Any = "0", token: str | None = None) -> str:
+        try:
+            rid = quote(str(room_id or "").strip(), safe="")
+            if not rid:
+                return "请提供 room_id。"
+            seat_id = self._card_parse_seat(seat)
+            path = self._append_cardroom_token(f"/api/card-rooms/{rid}/view?seat={seat_id}", token)
+            status, data, text = await self._card_api_json("GET", path)
+            if status >= 400:
+                return self._card_error_text("获取 CardRoom 视角", status, data, text)
+            return "CardRoom seat 视角（不会泄露其他玩家手牌）：\n" + self._card_json_text(data)
+        except Exception as exc:  # noqa: BLE001
+            return f"获取 CardRoom 视角失败：{exc}"
+
+    async def _card_tool_get_legal_actions(self, room_id: str, seat: Any = "0", token: str | None = None) -> str:
+        try:
+            rid = quote(str(room_id or "").strip(), safe="")
+            if not rid:
+                return "请提供 room_id。"
+            seat_id = self._card_parse_seat(seat)
+            path = self._append_cardroom_token(f"/api/card-rooms/{rid}/legal-actions?seat={seat_id}", token)
+            status, data, text = await self._card_api_json("GET", path)
+            if status >= 400:
+                return self._card_error_text("获取合法动作", status, data, text)
+            return "CardRoom 合法动作摘要：\n" + self._card_json_text(data)
+        except Exception as exc:  # noqa: BLE001
+            return f"获取合法动作失败：{exc}"
+
+    async def _card_tool_play(self, room_id: str, seat: Any, cards: Any, reason: str = "", token: str | None = None) -> str:
+        try:
+            rid = quote(str(room_id or "").strip(), safe="")
+            if not rid:
+                return "请提供 room_id。"
+            card_list = self._card_parse_cards(cards)
+            if not card_list:
+                return "cards 不能为空；如果不出请用 card_arena_pass。"
+            payload = {
+                "seat": self._card_parse_seat(seat),
+                "action": "play",
+                "cards": card_list,
+                "source": "astrbot_llm",
+                "reason": str(reason or "")[:500],
+            }
+            if token:
+                payload["token"] = str(token)
+            status, data, text = await self._card_api_json("POST", f"/api/card-rooms/{rid}/actions", json_payload=payload)
+            if status >= 400:
+                return self._card_error_text("出牌", status, data, text)
+            return "出牌成功，网站裁判已审查并写入 SQLite：\n" + self._card_json_text({"move": data.get("move"), "state": data.get("state")}, limit=1600)
+        except Exception as exc:  # noqa: BLE001
+            return f"出牌失败：{exc}"
+
+    async def _card_tool_pass(self, room_id: str, seat: Any, reason: str = "", token: str | None = None) -> str:
+        try:
+            rid = quote(str(room_id or "").strip(), safe="")
+            if not rid:
+                return "请提供 room_id。"
+            payload = {
+                "seat": self._card_parse_seat(seat),
+                "action": "pass",
+                "cards": [],
+                "source": "astrbot_llm",
+                "reason": str(reason or "")[:500],
+            }
+            if token:
+                payload["token"] = str(token)
+            status, data, text = await self._card_api_json("POST", f"/api/card-rooms/{rid}/actions", json_payload=payload)
+            if status >= 400:
+                return self._card_error_text("Pass", status, data, text)
+            return "pass 成功，网站裁判已审查并写入 SQLite：\n" + self._card_json_text({"move": data.get("move"), "state": data.get("state")}, limit=1600)
+        except Exception as exc:  # noqa: BLE001
+            return f"pass 失败：{exc}"
+
+    async def _cardroom_poll_loop(self) -> None:
+        while not self._stopping.is_set():
+            try:
+                for binding in list(self.cardroom_seats):
+                    await self._cardroom_maybe_act(binding)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[ChessArena] CardRoom poll failed: %s", exc)
+            await asyncio.sleep(self.cardroom_poll_interval)
+
+    async def _cardroom_maybe_act(self, binding: dict[str, Any]) -> None:
+        room_id = str(binding.get("room_id") or "").strip()
+        seat = self._card_parse_seat(binding.get("seat"))
+        token = str(binding.get("token") or "").strip()
+        if not room_id:
+            return
+        rid = quote(room_id, safe="")
+        view_path = self._append_cardroom_token(f"/api/card-rooms/{rid}/view?seat={seat}", token)
+        legal_path = self._append_cardroom_token(f"/api/card-rooms/{rid}/legal-actions?seat={seat}", token)
+        v_status, view, v_text = await self._card_api_json("GET", view_path)
+        if v_status >= 400:
+            logger.warning("[ChessArena] CardRoom view failed room=%s seat=%s HTTP %s %s", room_id, seat, v_status, v_text[:120])
+            return
+        l_status, legal, l_text = await self._card_api_json("GET", legal_path)
+        if l_status >= 400:
+            logger.warning("[ChessArena] CardRoom legal-actions failed room=%s seat=%s HTTP %s %s", room_id, seat, l_status, l_text[:120])
+            return
+        if not isinstance(legal, dict) or not legal.get("is_my_turn"):
+            return
+
+        # ── CardRoom LLM context session ────────────────────────────────────
+        selected: dict[str, Any] = {"action": "pass", "cards": [], "reason": "astrbot_no_action"}
+        session_key = f"{room_id}:{seat}"
+        session = self._cardroom_sessions.get(session_key)
+        if session is None:
+            session = CardRoomDecisionSession(
+                room_id=room_id,
+                seat=seat,
+                created_at=time.time(),
+                updated_at=time.time(),
+                persona=self.cardroom_persona_prompt,
+            )
+            self._cardroom_sessions[session_key] = session
+        view_dict = view if isinstance(view, dict) else {}
+
+        # LLM decision (if enabled); fallback to min-legal on failure
+        llm_candidates: list[dict[str, Any]] = []
+        if self.cardroom_llm_decision_enabled:
+            llm_candidates = await self._cardroom_llm_decide(session, view_dict, legal)
+        if llm_candidates:
+            selected = llm_candidates[0]
+            selected.setdefault("speech", self._cardroom_default_speech(selected))
+        else:
+            selected = self._select_cardroom_action(view_dict, legal)
+            selected.setdefault("speech", self._cardroom_default_speech(selected))
+        # ────────────────────────────────────────────────────────────────────
+        if self.cardroom_prompt_decision_enabled:
+            payload = {
+                "seat": seat,
+                "max_retries": self.cardroom_prompt_max_retries,
+                "candidates": [selected],
+            }
+            path = f"/api/card-rooms/{rid}/prompt-decision"
+        else:
+            payload = {
+                "seat": seat,
+                "action": selected["action"],
+                "cards": selected.get("cards") or [],
+                "source": "astrbot_cardroom_bot",
+                "reason": selected.get("reason") or "astrbot_cardroom_bot",
+                "speech": selected.get("speech") or "",
+            }
+            path = f"/api/card-rooms/{rid}/actions"
+        if token:
+            payload["token"] = token
+        status, data, text = await self._card_api_json("POST", path, json_payload=payload)
+        logger.info(
+            "[ChessArena] CardRoom bot room_id=%s seat=%s legal_count=%s prompt_decision=%s selected=%s submit_status=%s result=%s",
+            room_id,
+            seat,
+            self._cardroom_legal_count(legal),
+            self.cardroom_prompt_decision_enabled,
+            selected,
+            status,
+            text[:160],
+        )
+
+        accepted = 200 <= status < 300
+        self._update_cardroom_session(session, view_dict, legal, selected, accepted)
+
+    @staticmethod
+    def _cardroom_legal_count(legal: dict[str, Any]) -> int:
+        groups = legal.get("candidate_groups") if isinstance(legal.get("candidate_groups"), dict) else {}
+        total = 0
+        for key, value in groups.items():
+            if key == "rocket_cards":
+                continue
+            if isinstance(value, list):
+                total += len(value)
+            elif value:
+                total += 1
+        if legal.get("can_pass"):
+            total += 1
+        return total
+
+    # ── CardRoom LLM context helpers ────────────────────────────────────────
+
+    def _cardroom_state_hash(self, view: dict[str, Any], legal: dict[str, Any]) -> str:
+        """轻量局面哈希，防止同一局面重复决策。"""
+        raw = json.dumps({
+            "my_hand": sorted(view.get("my_hand") or []),
+            "current_seat": view.get("current_seat"),
+            "last_play": view.get("last_play"),
+        }, sort_keys=True)
+        return hashlib.md5(raw.encode()).hexdigest()
+
+    def _build_cardroom_decision_prompt(
+        self,
+        session: CardRoomDecisionSession,
+        view: dict[str, Any],
+        legal: dict[str, Any],
+    ) -> str:
+        """构造每回合增量 user prompt，不重复完整规则。"""
+        my_hand = view.get("my_hand") or []
+        opponent_counts = {
+            f"seat{s}": view.get("opponent_hand_counts", {}).get(str(s), "?")
+            for s in (0, 1, 2) if str(s) != session.seat
+        }
+        groups = legal.get("candidate_groups") or {}
+        group_lines: list[str] = []
+        for k, v in groups.items():
+            if k == "rocket_cards":
+                continue
+            items = v if isinstance(v, list) else ([v] if v else [])
+            group_lines.append(f"  {k}: {items[:8]}")
+        history_text = (
+            "\n".join(f"- {h}" for h in session.history_summary[-6:])
+            or "（新牌局）"
+        )
+        return (
+            f"回合 #{session.turn_count + 1}\n\n"
+            f"你的手牌：{my_hand}\n"
+            f"其他玩家手牌数量：{opponent_counts}\n"
+            f"地主 seat：{view.get('landlord_seat', '?')}\n"
+            f"当前回合 seat：{view.get('current_seat', '?')}\n"
+            f"上一手：{view.get('last_play') or '开局'}\n"
+            f"pass 计数：{view.get('pass_count', 0)}\n"
+            f"你能 pass：{legal.get('can_pass', False)}\n"
+            f"\n合法候选：\n" + "\n".join(group_lines)
+            + f"\n\n最近对局摘要：\n{history_text}\n\n"
+            f"请以 JSON 输出你的决策。"
+        )
+
+    @staticmethod
+    def _parse_llm_candidates(raw: str) -> list[dict[str, Any]]:
+        """从 LLM 输出提取 JSON candidates，最少返回一条 pass。"""
+        import re as _re
+        m = _re.search(r'```(?:json)?\s*\n?(.*?)\n?```', raw, _re.DOTALL)
+        if m:
+            raw = m.group(1)
+        try:
+            obj = json.loads(raw.strip())
+        except json.JSONDecodeError:
+            m2 = _re.search(r'\{[^{}]*"action"[^{}]*\}', raw)
+            if m2:
+                try:
+                    obj = json.loads(m2.group(0))
+                except json.JSONDecodeError:
+                    return [{"action": "pass", "cards": [], "reason": "parse_failed", "speech": ""}]
+            else:
+                return [{"action": "pass", "cards": [], "reason": "parse_failed", "speech": ""}]
+        if isinstance(obj, dict) and "candidates" in obj:
+            return obj["candidates"]
+        if isinstance(obj, dict) and "action" in obj:
+            return [obj]
+        return [{"action": "pass", "cards": [], "reason": "parse_failed", "speech": ""}]
+
+    def _update_cardroom_session(
+        self,
+        session: CardRoomDecisionSession,
+        view: dict[str, Any],
+        legal: dict[str, Any],
+        selected: dict[str, Any],
+        accepted: bool,
+    ) -> None:
+        """每回合结束后更新 session 摘要。"""
+        import time as _time
+        session.turn_count += 1
+        session.last_state_hash = self._cardroom_state_hash(view, legal)
+        session.updated_at = _time.time()
+        action = selected.get("action", "?")
+        cards = selected.get("cards") or []
+        speech = selected.get("speech") or ""
+        status = "✓" if accepted else "✗"
+        card_str = ",".join(cards) if cards else "pass"
+        summary = (
+            f"回合 {session.turn_count}: {action} {card_str} [{status}]"
+            f" — {speech}"
+        )
+        session.history_summary.append(summary)
+        if len(session.history_summary) > self.cardroom_context_max_history:
+            session.history_summary = session.history_summary[
+                -self.cardroom_context_max_history:
+            ]
+        if not accepted:
+            session.last_errors.append(f"回合 {session.turn_count}: rejected")
+            if len(session.last_errors) > 5:
+                session.last_errors = session.last_errors[-5:]
+
+    async def _cardroom_llm_decide(
+        self,
+        session: CardRoomDecisionSession,
+        view: dict[str, Any],
+        legal: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        """调用 LLM 生成候选动作列表（15s 超时，失败返回空列表）。"""
+        provider = await self._resolve_llm_provider()
+        if not provider:
+            logger.debug("[ChessArena] CardRoom LLM decide: no provider available")
+            return []
+        prompt = self._build_cardroom_decision_prompt(session, view, legal)
+        system_prompt = session.persona or self.cardroom_persona_prompt
+        try:
+            response = await asyncio.wait_for(
+                provider.text_chat(
+                    prompt=prompt,
+                    system_prompt=system_prompt,
+                    contexts=[],
+                ),
+                timeout=15,
+            )
+            raw = str(getattr(response, "completion_text", response) or "")
+            candidates = self._parse_llm_candidates(raw)
+            logger.info(
+                "[ChessArena] CardRoom LLM decide room=%s seat=%s turn=%d candidates=%d",
+                session.room_id,
+                session.seat,
+                session.turn_count + 1,
+                len(candidates),
+            )
+            return candidates
+        except asyncio.TimeoutError:
+            logger.warning("[ChessArena] CardRoom LLM decide timeout room=%s seat=%s", session.room_id, session.seat)
+        except Exception as exc:
+            logger.warning("[ChessArena] CardRoom LLM decide failed room=%s seat=%s: %s", session.room_id, session.seat, exc)
+        return []
+
+    # ─────────────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _select_cardroom_action(view: dict[str, Any], legal: dict[str, Any]) -> dict[str, Any]:
+        groups = legal.get("candidate_groups") if isinstance(legal.get("candidate_groups"), dict) else {}
+        for key in ("singles", "pairs", "triples", "triple_with_single", "triple_with_pair", "straights", "consecutive_pairs", "bombs"):
+            items = groups.get(key)
+            if not items:
+                continue
+            cards = items[0]
+            if isinstance(cards, str):
+                cards = [cards]
+            return {"action": "play", "cards": list(cards), "reason": f"astrbot_min_{key}"}
+        if groups.get("rocket") and groups.get("rocket_cards"):
+            return {"action": "play", "cards": list(groups.get("rocket_cards") or []), "reason": "astrbot_min_rocket"}
+        if legal.get("can_pass"):
+            return {"action": "pass", "cards": [], "reason": "astrbot_no_legal_play"}
+        # Fairness rule: only act from legal-actions candidates; do not invent a
+        # play directly from my_hand when legal-actions has no playable group.
+        return {"action": "pass", "cards": [], "reason": "astrbot_no_legal_action"}
+
     def _match_url(self, match_id: Any) -> str:
         return f"{self.arena_base}/matches/{quote(str(match_id), safe='')}"
 
@@ -588,23 +1208,53 @@ class ChessArenaPlugin(Star):
         return bool(name and name == self.effective_bot_name)
 
     @staticmethod
-    def _bot_priority(bot: dict[str, Any]) -> tuple[int, int, int]:
-        online = bool(bot.get("online", bot.get("is_online", False)))
-        enabled = bool(bot.get("is_enabled", bot.get("enabled", True)))
-        public = bool(bot.get("is_public", bot.get("public", True)))
-        return (1 if online else 0, 1 if enabled else 0, 1 if public else 0)
+    def _truthy_status(value: Any, default: bool = False) -> bool:
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        text = str(value).strip().lower()
+        if text in {"online", "connected", "active", "ready", "available", "enabled", "true", "1", "yes", "y", "on"}:
+            return True
+        if text in {"offline", "disconnected", "inactive", "unavailable", "disabled", "false", "0", "no", "n", "off"}:
+            return False
+        return default
+
+    @classmethod
+    def _bot_online(cls, bot: dict[str, Any]) -> bool:
+        return cls._truthy_status(
+            bot.get("online", bot.get("is_online", bot.get("online_status", bot.get("status")))),
+            default=False,
+        )
 
     @staticmethod
-    def _bot_available(bot: dict[str, Any]) -> bool:
-        online = bot.get("online", bot.get("is_online", False))
-        enabled = bot.get("is_enabled", bot.get("enabled", True))
-        public = bot.get("is_public", bot.get("public", True))
-        return bool(online) and bool(enabled) and bool(public)
+    def _bot_enabled(bot: dict[str, Any]) -> bool:
+        return ChessArenaPlugin._truthy_status(bot.get("is_enabled", bot.get("enabled")), default=True)
 
-    async def _fetch_bots(self, query: str = "") -> list[dict[str, Any]]:
-        path = "/api/bots"
+    @staticmethod
+    def _bot_public(bot: dict[str, Any]) -> bool:
+        return ChessArenaPlugin._truthy_status(bot.get("is_public", bot.get("public")), default=True)
+
+    @classmethod
+    def _bot_priority(cls, bot: dict[str, Any]) -> tuple[int, int, int]:
+        online = cls._bot_online(bot)
+        enabled = cls._bot_enabled(bot)
+        public = cls._bot_public(bot)
+        return (1 if online else 0, 1 if enabled else 0, 1 if public else 0)
+
+    @classmethod
+    def _bot_available(cls, bot: dict[str, Any]) -> bool:
+        return cls._bot_online(bot) and cls._bot_enabled(bot) and cls._bot_public(bot)
+
+    async def _fetch_bots(self, query: str = "", game: str = "") -> list[dict[str, Any]]:
+        normalized_game = self._normalize_game(game)
+        query = str(query or "").strip()
+        params = [f"game={quote(normalized_game, safe='')}"]
         if query:
-            path += f"?q={quote(query, safe='')}"
+            params.insert(0, f"q={quote(query, safe='')}")
+        path = "/api/bots?" + "&".join(params)
         _base, status, data, _text = await self._api_json(
             "GET",
             path,
@@ -614,7 +1264,7 @@ class ChessArenaPlugin(Star):
         if status >= 400 and query:
             _base, status, data, _text = await self._api_json(
                 "GET",
-                "/api/bots",
+                f"/api/bots?game={quote(normalized_game, safe='')}",
                 headers=self._auth_headers() if self.token else None,
                 timeout=aiohttp.ClientTimeout(total=10),
             )
@@ -622,11 +1272,11 @@ class ChessArenaPlugin(Star):
             raise RuntimeError(f"HTTP {status}")
         return self._list_from_response(data, "bots", "items", "data")
 
-    async def _find_bot(self, query: str, exclude_self: bool = True) -> tuple[dict[str, Any] | None, str]:
+    async def _find_bot(self, query: str, exclude_self: bool = True, game: str = "") -> tuple[dict[str, Any] | None, str]:
         query = str(query or "").strip()
         if not query:
             return None, "你要挑战谁？用法：棋擂台挑战 <名字或bot_id> [红|黑|随机]"
-        bots = await self._fetch_bots(query)
+        bots = await self._fetch_bots(query, game=game)
         if exclude_self:
             bots = [bot for bot in bots if not self._is_self_bot(bot)]
         q = query.lower()
@@ -894,6 +1544,10 @@ class ChessArenaPlugin(Star):
             "commentary_timeout_sec": self.commentary_timeout_sec,
             "llm_provider_mode": self.llm_provider_mode,
             "llm_provider_id": self.llm_provider_id,
+            "llm_tools_enabled": self.llm_tools_enabled,
+            "llm_tools_allow_actions": self.llm_tools_allow_actions,
+            "default_game": self.default_game,
+            "enabled_games": ",".join(self.enabled_games),
             "auto_accept_challenges": self.auto_accept_challenges,
             "challenge_decision_mode": self.challenge_decision_mode,
             "challenge_policy": self.server_challenge_policy,
@@ -1043,6 +1697,10 @@ class ChessArenaPlugin(Star):
             await self._handle_challenge_received(payload)
         elif event_type == "your_turn":
             await self._handle_your_turn(payload)
+        elif event_type in {"challenge_accepted", "match_started", "move_made", "match_state"}:
+            self._remember_match_event(event_type, payload)
+        elif event_type == "match_finished":
+            await self._handle_match_finished(payload)
 
     async def _handle_challenge_received(self, event: dict[str, Any]) -> None:
         challenge_id = self._challenge_id(event)
@@ -1054,21 +1712,38 @@ class ChessArenaPlugin(Star):
         if mode == "ignore":
             self._routine_log("[ChessArena] 已忽略挑战 %s：challenge_decision_mode=ignore", challenge_id)
             return
+        if str(challenge_id) in self.notified_challenges:
+            self._routine_log("[ChessArena] 挑战 %s 已通知过，跳过重复通知", challenge_id)
+            return
+        if self._challenge_expired(event) or self._challenge_too_old(event):
+            self.pending_owner_challenges.pop(str(challenge_id), None)
+            self.notified_challenges.add(str(challenge_id))
+            self._routine_log("[ChessArena] 跳过已过期/旧挑战 %s", challenge_id)
+            return
+        status = str(event.get("status") or "").strip().lower()
+        if status and status not in {"owner_review", "pending", "waiting_owner"}:
+            self.pending_owner_challenges.pop(str(challenge_id), None)
+            self._routine_log("[ChessArena] 跳过非待审批挑战 %s status=%s", challenge_id, status)
+            return
         if mode == "auto_accept":
             await self._accept_challenge(challenge_id)
             return
 
         # owner_approve：只登记/通知，不阻塞 SSE；主人稍后用命令同意/拒绝。
+        if str(challenge_id) in self.pending_owner_challenges:
+            self.notified_challenges.add(str(challenge_id))
+            self._routine_log("[ChessArena] 挑战 %s 已在待审批列表，跳过重复通知", challenge_id)
+            return
         record = dict(event)
         record["challenge_id"] = str(challenge_id)
         record["received_at"] = time.time()
         self.pending_owner_challenges[str(challenge_id)] = record
         text = self._owner_challenge_text(record)
+        self.notified_challenges.add(str(challenge_id))
         if self.owner_notify_enabled:
-            try:
-                await self._notify_owner(text)
-            except Exception as exc:  # noqa: BLE001 - 主动通知失败不能影响 SSE
-                logger.warning("[ChessArena] 主人挑战审批通知失败，已保留待确认: %s", exc)
+            task = asyncio.create_task(self._notify_owner_safe(text), name=f"chess_arena_notify_{challenge_id}")
+            self._notify_tasks.add(task)
+            task.add_done_callback(self._notify_tasks.discard)
         self._routine_log("[ChessArena] 挑战 %s 等待主人审批", challenge_id)
 
     async def _accept_challenge(self, challenge_id: Any) -> dict[str, Any]:
@@ -1087,16 +1762,52 @@ class ChessArenaPlugin(Star):
             return {"raw": text}
 
     async def _handle_your_turn(self, event: dict[str, Any]) -> None:
-        legal_moves = event.get("legal_moves") or event.get("legalMoves") or []
-        if not isinstance(legal_moves, list) or not legal_moves:
-            logger.warning("[ChessArena] your_turn 无 legal_moves: %s", event)
-            return
-        move = await self._choose_move(legal_moves, event)
+        game = self._event_game(event)
         match_id = event.get("match_id") or event.get("matchId") or event.get("id")
         if not match_id:
             logger.warning("[ChessArena] your_turn 缺少 match_id: %s", event)
             return
 
+        if game == "go":
+            await self._handle_go9_your_turn(str(match_id), event)
+            return
+
+        legal_moves = event.get("legal_moves") or event.get("legalMoves") or []
+        if not isinstance(legal_moves, list) or not legal_moves:
+            logger.warning("[ChessArena] your_turn 无 legal_moves: %s", event)
+            return
+        move = await self._choose_move(legal_moves, event)
+        await self._submit_arena_move(str(match_id), move, event)
+
+    def _event_game(self, event: dict[str, Any]) -> str:
+        game = event.get("game")
+        if not game and isinstance(event.get("match"), dict):
+            game = event["match"].get("game")
+        return self._game_alias_to_id(game) or "xiangqi"
+
+    async def _handle_go9_your_turn(self, match_id: str, event: dict[str, Any]) -> None:
+        """Go 9×9 MVP：只从后端 legal_moves 选非 pass 合法点；不接 KataGo，不走象棋引擎。"""
+        side = str(event.get("side") or event.get("turn") or "").strip()
+        legal_moves = event.get("legal_moves") or event.get("legalMoves") or []
+        if not isinstance(legal_moves, list):
+            legal_moves = []
+        legal = [str(move).strip() for move in legal_moves if str(move or "").strip()]
+        move = await self._choose_go9_engine_or_fallback_move(match_id, event, legal_moves=legal)
+        status, text = await self._submit_arena_move(match_id, move, event, raise_on_error=False)
+        if status < 400:
+            logger.info("[ChessArena] go9 submit success match_id=%s side=%s move=%s result=%s", match_id, side, move, text[:160])
+            return
+        logger.warning("[ChessArena] go9 submit failed match_id=%s side=%s move=%s HTTP %s %s", match_id, side, move, status, text[:160])
+        raise RuntimeError(f"submit go9 move failed: HTTP {status} {text[:200]}")
+
+    async def _submit_arena_move(
+        self,
+        match_id: str,
+        move: str,
+        event: dict[str, Any],
+        *,
+        raise_on_error: bool = True,
+    ) -> tuple[int, str]:
         started = time.perf_counter()
         comment = await self._make_comment(move, event)
         duration_ms = max(1, int((time.perf_counter() - started) * 1000))
@@ -1114,9 +1825,12 @@ class ChessArenaPlugin(Star):
             timeout=timeout,
         )
         if status >= 400:
-            raise RuntimeError(f"submit move failed: HTTP {status} {text[:200]}")
+            if raise_on_error:
+                raise RuntimeError(f"submit move failed: HTTP {status} {text[:200]}")
+            return status, text
         self.state.submitted_moves += 1
         self._routine_log("[ChessArena] match=%s 已提交走法: %s comment=%s", match_id, move, comment)
+        return status, text
 
     async def _choose_move(self, legal_moves: list[Any], event: dict[str, Any]) -> str:
         """始终从后端给出的 legal_moves 中选步；按 engine_mode 走引擎链，最终随机兜底。"""
@@ -1124,6 +1838,142 @@ class ChessArenaPlugin(Star):
         if not moves:
             raise RuntimeError("no legal moves")
         return await self._run_engine_chain(moves, event)
+
+    async def _choose_go9_engine_or_fallback_move(self, match_id: str, event: dict[str, Any], legal_moves: list[str]) -> str:
+        """Use Go9 engine adapter when enabled; otherwise keep the current random/pass fallback."""
+        legal = [str(move).strip() for move in legal_moves if str(move or "").strip()]
+        if self.go_engine_enabled:
+            try:
+                best = await self._call_go9_engine(match_id, event, legal)
+                valid = self._validate_go9_engine_move(best, legal)
+                if valid:
+                    self._routine_log("[ChessArena] heuristic_go9 chose: %s", valid)
+                    return valid
+            except Exception as exc:  # noqa: BLE001 - Go engine must never break move submission
+                logger.warning("[ChessArena] go9 engine failed, falling back to random/pass: %s", exc)
+            if not self.go_engine_fallback_random:
+                return "pass"
+        return self._choose_go9_move(event, legal_moves=legal)
+
+    async def _call_go9_engine(self, match_id: str, event: dict[str, Any], legal_moves: list[str]) -> str | None:
+        if not self.token:
+            logger.warning("[ChessArena] go9 engine skipped: missing bot token")
+            return None
+        endpoint = (self.go_engine_endpoint or "http://127.0.0.1:8787/api/go9/analyze").strip()
+        if not endpoint:
+            logger.warning("[ChessArena] go9 engine skipped: empty endpoint")
+            return None
+        state = self._go9_engine_state_from_event(event)
+        payload = {"state": state, "depth": max(1, int(self.engine_depth or 1))}
+        if legal_moves:
+            payload["legal_moves"] = legal_moves
+        payload["match_id"] = match_id
+        timeout = aiohttp.ClientTimeout(total=self.go_engine_timeout_sec)
+        headers = {
+            "Authorization": f"Bearer {self.token}",
+            "Content-Type": "application/json",
+        }
+        session = await self._get_session()
+        if endpoint.startswith("http://") or endpoint.startswith("https://"):
+            async with session.post(endpoint, json=payload, headers=headers, timeout=timeout) as resp:
+                text = await resp.text()
+                status = resp.status
+        else:
+            _base, status, text = await self._request_text_with_fallback("POST", endpoint if endpoint.startswith("/") else f"/{endpoint}", json_payload=payload, headers=headers, timeout=timeout)
+        if status >= 400:
+            logger.warning("[ChessArena] go9 engine analyze failed: HTTP %s %s", status, text[:160])
+            return None
+        try:
+            data = json.loads(text) if text else {}
+        except json.JSONDecodeError:
+            logger.warning("[ChessArena] go9 engine returned non-json: %s", text[:160])
+            return None
+        if not isinstance(data, dict):
+            logger.warning("[ChessArena] go9 engine returned non-object: %s", str(data)[:160])
+            return None
+        return data.get("best_move") or data.get("move")
+
+    def _go9_engine_state_from_event(self, event: dict[str, Any]) -> dict[str, Any]:
+        state = self._go9_state_from_event(event)
+        if not isinstance(state, dict):
+            state = {}
+        board = state.get("board") or event.get("board")
+        if board is not None:
+            state["board"] = board
+        turn = state.get("turn") or event.get("side")
+        if turn:
+            state["turn"] = str(turn).strip()
+        if "passes" not in state:
+            for key in ("passes", "pass_count", "passCount"):
+                if key in event:
+                    state["passes"] = event.get(key)
+                    break
+            else:
+                state["passes"] = 0
+        return state
+
+    @staticmethod
+    def _normalize_go9_move(move: Any) -> str:
+        text = str(move or "").strip()
+        if not text:
+            return ""
+        if text.lower() == "pass":
+            return "pass"
+        return text
+
+    def _validate_go9_engine_move(self, move: Any, legal_moves: list[str]) -> str | None:
+        best = self._normalize_go9_move(move)
+        legal = [self._normalize_go9_move(item) for item in legal_moves if self._normalize_go9_move(item)]
+        if best and legal and best in legal:
+            return best
+        if best and not legal:
+            logger.warning("[ChessArena] go9 engine returned %s but legal_moves missing; fallback for safety", best)
+            return None
+        logger.warning("[ChessArena] go9 engine returned illegal/empty move %s, legal_moves=%s", best, legal[:20])
+        return None
+
+    def _choose_go9_move(self, event: dict[str, Any], tried: set[str] | None = None, legal_moves: list[str] | None = None) -> str:
+        legal = [str(move).strip() for move in (legal_moves or []) if str(move or "").strip()]
+        non_pass = [move for move in legal if move.lower() != "pass"]
+        if non_pass:
+            return random.choice(non_pass)
+        if "pass" in {move.lower() for move in legal}:
+            return "pass"
+        tried = tried or set()
+        state = self._go9_state_from_event(event)
+        board = state.get("board") if isinstance(state, dict) else None
+        size = int(state.get("size") or 9) if isinstance(state, dict) else 9
+        if not isinstance(board, list) or size < 1:
+            return "pass"
+        candidates: list[str] = []
+        max_size = min(size, 25)
+        for row_idx, row in enumerate(board[:max_size]):
+            if not isinstance(row, list):
+                continue
+            for col_idx, value in enumerate(row[:max_size]):
+                if value is None or value == "":
+                    coord = f"{chr(ord('a') + col_idx)}{size - row_idx}"
+                    if coord not in tried:
+                        candidates.append(coord)
+        if not candidates:
+            return "pass"
+        return random.choice(candidates)
+
+    def _go9_state_from_event(self, event: dict[str, Any]) -> dict[str, Any]:
+        for key in ("state", "state_json", "fen"):
+            raw = event.get(key)
+            if raw is None and isinstance(event.get("match"), dict):
+                raw = event["match"].get(key)
+            if isinstance(raw, dict):
+                return raw
+            if isinstance(raw, str) and raw.strip():
+                try:
+                    data = json.loads(raw)
+                    if isinstance(data, dict):
+                        return data
+                except json.JSONDecodeError:
+                    continue
+        return {}
 
     def _engine_request_payload(self, legal_moves: list[str], event: dict[str, Any]) -> dict[str, Any]:
         side = str(event.get("side") or event.get("turn") or "").strip()
@@ -1326,10 +2176,23 @@ class ChessArenaPlugin(Star):
     async def _make_comment(self, move: str, event: dict[str, Any]) -> str:
         if not self.commentary_enabled:
             return ""
+        if self._event_game(event) == "go":
+            return self._template_go9_comment(move, event)
         facts = self._analyze_move_facts(move, event)
         fallback = self._template_comment(move, event, facts)
         llm_comment = await self._try_llm_comment(move, event, fallback, facts)
         return self._sanitize_comment(llm_comment or fallback, facts)
+
+    def _template_go9_comment(self, move: str, event: dict[str, Any]) -> str:
+        side = str(event.get("side") or event.get("turn") or "").lower()
+        side_label = {"black": "黑棋", "white": "白棋"}.get(side, "围棋")
+        if str(move).lower() == "pass":
+            return f"{side_label}这手先停一手。"
+        return random.choice([
+            f"{side_label}落在 {move}，先占个点。",
+            f"{side_label}下 {move}，慢慢围。",
+            f"{side_label}先走 {move}。",
+        ])
 
     async def _try_llm_comment(
         self, move: str, event: dict[str, Any], fallback: str, facts: dict[str, Any]
@@ -1613,6 +2476,135 @@ class ChessArenaPlugin(Star):
             f"请回复：棋擂台同意 {challenge_id} / 棋擂台拒绝 {challenge_id}"
         )
 
+    def _challenge_expired(self, event: dict[str, Any], *, grace_sec: float = 5.0) -> bool:
+        expires = self._challenge_value(event, "expires_at", "expiresAt", "expire_at", "expireAt")
+        if not expires:
+            return False
+        try:
+            return float(expires) + grace_sec < time.time()
+        except Exception:
+            return False
+
+    def _challenge_too_old(self, event: dict[str, Any], *, max_age_sec: float = 60.0) -> bool:
+        created = self._challenge_value(event, "created_at", "createdAt", "created", "timestamp", "ts")
+        if not created:
+            return False
+        try:
+            value = float(created)
+            if value > 10_000_000_000:  # tolerate millisecond timestamps
+                value /= 1000.0
+            return time.time() - value > max_age_sec
+        except Exception:
+            return False
+
+    async def _notify_owner_safe(self, text: str) -> None:
+        try:
+            await self._notify_owner(text)
+        except Exception as exc:  # noqa: BLE001 - 主动通知失败不能影响 SSE
+            logger.warning("[ChessArena] 主人挑战审批通知失败，已保留待确认: %s", exc)
+
+    @staticmethod
+    def _match_id_from_event(event: dict[str, Any]) -> str:
+        match = event.get("match") if isinstance(event.get("match"), dict) else {}
+        for source in (event, match):
+            value = source.get("match_id") or source.get("matchId") or source.get("id")
+            if value:
+                return str(value)
+        return ""
+
+    def _remember_match_event(self, event_type: str, event: dict[str, Any]) -> None:
+        match_id = self._match_id_from_event(event)
+        if not match_id:
+            return
+        match = event.get("match") if isinstance(event.get("match"), dict) else event
+        status = str(match.get("status") or event.get("status") or "").lower()
+        if event_type == "challenge_accepted":
+            cid = self._challenge_id(event)
+            if cid:
+                self.pending_owner_challenges.pop(str(cid), None)
+        if status == "finished":
+            self._remember_match_finished(match)
+            return
+        rec = dict(self.active_matches.get(match_id) or {})
+        rec.update({k: v for k, v in match.items() if k != "moves"})
+        rec["match_id"] = match_id
+        rec["last_event"] = event_type
+        rec["updated_at_local"] = time.time()
+        self.active_matches[match_id] = rec
+
+    async def _handle_match_finished(self, event: dict[str, Any]) -> None:
+        match_id = self._match_id_from_event(event)
+        if not match_id:
+            logger.warning("[ChessArena] match_finished 缺少 match_id: %s", self._short(event))
+            return
+        if match_id in self.finished_games:
+            self._routine_log("[ChessArena] 对局 %s 已处理过结束事件，跳过重复通知", match_id)
+            return
+        rec = self._remember_match_finished(event)
+        self.finished_games.add(match_id)
+        self._routine_log("[ChessArena] 对局 %s 已结束: %s", match_id, self._latest_finished_match_line())
+        if self.match_report_enabled and self.owner_notify_enabled:
+            text = self._match_finished_report_text(rec)
+            task = asyncio.create_task(self._notify_owner_safe(text), name=f"chess_arena_match_finished_{match_id}")
+            self._notify_tasks.add(task)
+            task.add_done_callback(self._notify_tasks.discard)
+
+    def _remember_match_finished(self, event: dict[str, Any]) -> dict[str, Any]:
+        match_id = self._match_id_from_event(event)
+        if not match_id:
+            return {}
+        match = event.get("match") if isinstance(event.get("match"), dict) else event
+        rec = dict(self.active_matches.pop(match_id, {}) or {})
+        rec.update({k: v for k, v in match.items() if k != "moves"})
+        rec["match_id"] = match_id
+        rec["status"] = "finished"
+        rec["updated_at_local"] = time.time()
+        self.recent_finished_matches.insert(0, rec)
+        self.recent_finished_matches = self.recent_finished_matches[:10]
+        return rec
+
+    def _match_finished_report_text(self, match: dict[str, Any]) -> str:
+        match_id = str(match.get("match_id") or "")
+        red = str(match.get("red_bot_name") or match.get("red_name") or match.get("red_bot_id") or "红方")
+        black = str(match.get("black_bot_name") or match.get("black_name") or match.get("black_bot_id") or "黑方")
+        result_line = self._latest_finished_match_line() or f"{match_id}：已结束"
+        ply = match.get("ply") or match.get("move_count") or "未知"
+        url = self._match_url(match_id) if match_id else self.arena_base
+        return (
+            "棋擂台对局已结束：\n"
+            f"对局：{red} vs {black}\n"
+            f"结果：{result_line}\n"
+            f"手数：{ply}\n"
+            f"链接：{url}"
+        )
+
+    def _active_match_lines(self) -> list[str]:
+        lines: list[str] = []
+        for match_id, m in sorted(self.active_matches.items(), key=lambda item: item[1].get("updated_at_local", 0), reverse=True):
+            red = str(m.get("red_bot_name") or m.get("red_name") or "红方")
+            black = str(m.get("black_bot_name") or m.get("black_name") or "黑方")
+            ply = m.get("ply") or m.get("move_count") or 0
+            turn = str(m.get("turn") or "").lower()
+            turn_label = {"red": "红方", "black": "黑方", "r": "红方", "b": "黑方"}.get(turn, "未知")
+            lines.append(f"- {match_id}：{red} vs {black}，{ply}手，轮到{turn_label}")
+        return lines
+
+    def _latest_finished_match_line(self) -> str:
+        if not self.recent_finished_matches:
+            return ""
+        m = self.recent_finished_matches[0]
+        result = str(m.get("result") or "").lower()
+        reason = str(m.get("finish_reason") or "").strip()
+        winner = str(m.get("winner_bot_name") or "").strip()
+        if not winner:
+            winner_id = str(m.get("winner_bot_id") or "")
+            if winner_id and winner_id == str(m.get("red_bot_id") or ""):
+                winner = str(m.get("red_bot_name") or "")
+            elif winner_id and winner_id == str(m.get("black_bot_id") or ""):
+                winner = str(m.get("black_bot_name") or "")
+        label = "和棋" if result == "draw" else (f"{winner} 胜" if winner else (result or "已结束"))
+        return f"{m.get('match_id') or ''}：{label}" + (f"，原因={reason}" if reason else "")
+
     def _owner_notify_target_list(self) -> list[str]:
         raw = str(self.owner_notify_targets or "").replace("\n", ",")
         targets: list[str] = []
@@ -1633,34 +2625,97 @@ class ChessArenaPlugin(Star):
             return
         chain = MessageChain([Plain(text)])
         for target in targets:
+            delivered = False
             for umo in self._target_umo_candidates(target):
                 try:
+                    await self._wait_for_platform_ready(umo)
                     result = sender(umo, chain)
                     if inspect.isawaitable(result):
-                        await result
+                        result = await result
+                    if result is False:
+                        logger.warning("[ChessArena] 发送挑战审批通知到 %s 失败: 未找到对应平台或平台未就绪。", umo)
+                        continue
                     self._routine_log("[ChessArena] 已发送挑战审批通知到 %s", umo)
+                    delivered = True
                     break
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("[ChessArena] 发送挑战审批通知到 %s 失败: %s", umo, exc)
+            if not delivered:
+                logger.warning("[ChessArena] 挑战审批通知目标 %s 全部候选发送失败。", target)
 
     def _target_umo_candidates(self, target: str) -> list[str]:
         target = str(target or "").strip()
         if not target:
             return []
-        if target.count(":") >= 2:
-            return [target]
-        platform = self._default_platform_id()
+        platforms = self._known_platform_ids()
         candidates: list[str] = []
-        if platform:
-            candidates.append(f"{platform}:FriendMessage:{target}")
-            candidates.append(f"{platform}:GroupMessage:{target}")
-        return candidates or [target]
+        if target.count(":") >= 2:
+            parts = target.split(":", 2)
+            if len(parts) == 3:
+                _old_platform, msg_type, peer = parts
+                for platform in platforms:
+                    candidates.append(f"{platform}:{msg_type}:{peer}")
+            candidates.append(target)
+        else:
+            for platform in platforms:
+                candidates.append(f"{platform}:FriendMessage:{target}")
+            for platform in platforms:
+                candidates.append(f"{platform}:GroupMessage:{target}")
+            if not candidates:
+                candidates.append(target)
+        deduped: list[str] = []
+        for item in candidates:
+            if item and item not in deduped:
+                deduped.append(item)
+        return deduped
+
+    async def _wait_for_platform_ready(self, umo: str, timeout_sec: float = 2.0) -> bool:
+        platform_id = str(umo or "").split(":", 1)[0]
+        if not platform_id:
+            return False
+        deadline = time.monotonic() + timeout_sec
+        while True:
+            try:
+                platforms = getattr(getattr(self.context, "platform_manager", None), "platform_insts", []) or []
+                if any(getattr(platform.meta(), "id", None) == platform_id for platform in platforms):
+                    return True
+            except Exception:  # noqa: BLE001 - readiness probe must not break notification
+                return False
+            if time.monotonic() >= deadline:
+                return False
+            await asyncio.sleep(0.5)
+
+    def _known_platform_ids(self) -> list[str]:
+        ids: list[str] = []
+        try:
+            platforms = getattr(getattr(self.context, "platform_manager", None), "platform_insts", []) or []
+            for platform in platforms:
+                pid = getattr(platform.meta(), "id", None)
+                if pid and pid not in ids:
+                    ids.append(str(pid))
+        except Exception:  # noqa: BLE001
+            pass
+        configured = str(self.config.get("owner_notify_platform") or "").strip()
+        if configured and configured not in ids:
+            ids.append(configured)
+        default = self._default_platform_id()
+        if default and default not in ids:
+            ids.append(default)
+        return ids
 
     def _default_platform_id(self) -> str:
         for attr in ("platform", "platform_id", "id"):
             value = getattr(self.context, attr, None)
             if value and isinstance(value, str):
                 return value
+        try:
+            platforms = getattr(getattr(self.context, "platform_manager", None), "platform_insts", []) or []
+            for platform in platforms:
+                pid = getattr(platform.meta(), "id", None)
+                if pid:
+                    return str(pid)
+        except Exception:  # noqa: BLE001
+            pass
         return str(self.config.get("owner_notify_platform") or "aiocqhttp").strip() or "aiocqhttp"
 
     def _pending_challenge_lines(self) -> list[str]:
@@ -1686,7 +2741,10 @@ class ChessArenaPlugin(Star):
             return
         now = time.time()
         timeout = max(1, self.owner_decision_timeout_sec)
-        expired = [cid for cid, item in self.pending_owner_challenges.items() if now - float(item.get("received_at") or now) > timeout]
+        expired = []
+        for cid, item in self.pending_owner_challenges.items():
+            if self._challenge_expired(item) or now - float(item.get("received_at") or now) > timeout:
+                expired.append(cid)
         for cid in expired:
             self.pending_owner_challenges.pop(cid, None)
 
@@ -1729,6 +2787,64 @@ class ChessArenaPlugin(Star):
             parts.append(f"状态：{status}")
         return "\n".join(parts)
 
+    @filter.command("斗地主房间")
+    async def cardroom_pool_command(self, event: AstrMessageEvent):
+        """查看 5 个斗地主房间槽。"""
+        yield event.plain_result(await self._card_tool_pool_status())
+
+    @filter.command("斗地主状态")
+    async def cardroom_pool_status_command(self, event: AstrMessageEvent):
+        """查看 5 个斗地主房间槽。"""
+        yield event.plain_result(await self._card_tool_pool_status())
+
+    @filter.command("斗地主加入")
+    async def cardroom_pool_join_command(self, event: AstrMessageEvent, slot: str = "1"):
+        """加入指定斗地主房间槽。"""
+        yield event.plain_result(await self._card_tool_pool_join(slot))
+
+    @filter.command("斗地主退出")
+    async def cardroom_pool_leave_command(self, event: AstrMessageEvent, slot: str = "1"):
+        """退出指定斗地主房间槽。"""
+        yield event.plain_result(await self._card_tool_pool_leave(slot))
+
+    @filter.command("斗地主开始")
+    async def cardroom_pool_start_command(self, event: AstrMessageEvent, slot: str = "1"):
+        """手动启动指定斗地主房间槽；满 3 人时网站也会自动开局。"""
+        yield event.plain_result(await self._card_tool_pool_start(slot))
+
+    @filter.command("斗地主创建")
+    async def cardroom_create_command(self, event: AstrMessageEvent, seed: int = 0, landlord_index: int = 0):
+        """直接创建一个调试用斗地主 CardRoom 房间。"""
+        if not self.llm_tools_allow_actions:
+            yield event.plain_result("斗地主创建需要先开启 llm_tools_allow_actions。")
+            return
+        yield event.plain_result(await self._card_tool_create_room(seed=seed, landlord_index=landlord_index))
+
+    @filter.command("斗地主看牌")
+    async def cardroom_view_command(self, event: AstrMessageEvent, room_id: str = "", seat: str = "0", token: str = ""):
+        """查看自己的斗地主私有视角。"""
+        yield event.plain_result(await self._card_tool_get_room(room_id=room_id, seat=seat, token=token or None))
+
+    @filter.command("斗地主合法")
+    async def cardroom_legal_command(self, event: AstrMessageEvent, room_id: str = "", seat: str = "0", token: str = ""):
+        """查看当前 seat 的合法动作。"""
+        yield event.plain_result(await self._card_tool_get_legal_actions(room_id=room_id, seat=seat, token=token or None))
+
+    @filter.command("斗地主决策")
+    async def cardroom_prompt_decision_command(
+        self,
+        event: AstrMessageEvent,
+        room_id: str = "",
+        seat: str = "0",
+        action: str = "",
+        cards: str = "",
+    ):
+        """提交一次 Prompt 决策；为空时自动从合法动作里选最小合法牌。"""
+        if not self.llm_tools_allow_actions:
+            yield event.plain_result("斗地主决策需要先开启 llm_tools_allow_actions。")
+            return
+        yield event.plain_result(await self._card_tool_prompt_decision(room_id=room_id, seat=seat, action=action, cards=cards))
+
     @filter.command("棋擂台状态")
     async def arena_status(self, event: AstrMessageEvent):
         """查看棋擂台连接和自动对弈状态。"""
@@ -1737,6 +2853,8 @@ class ChessArenaPlugin(Star):
         )
         status = "在线" if self.state.connected else "离线"
         token_status = "已配置" if self.token else "未配置"
+        active_lines = self._active_match_lines()
+        recent_finished = self._latest_finished_match_line()
         msg = (
             f"棋擂台状态：{status}\n"
             f"平台：{self.arena_base}\n"
@@ -1749,12 +2867,17 @@ class ChessArenaPlugin(Star):
             f"挑战处理模式：{self.challenge_decision_mode}\n"
             f"主人通知目标：{'已配置' if self._owner_notify_target_list() else '未配置'}\n"
             f"待主人确认：{len(self._pending_challenge_lines())}\n"
+            f"进行中对局：{len(active_lines)}\n"
             f"走棋台词：{self.commentary_enabled}\n"
             f"LLM模型：{self._llm_provider_status()}\n"
             f"已接挑战/已走棋：{self.state.accepted_challenges}/{self.state.submitted_moves}\n"
             f"重连次数：{self.state.reconnect_count}\n"
             f"最近事件：{last_event}"
         )
+        if active_lines:
+            msg += "\n" + "\n".join(active_lines[:5])
+        if recent_finished:
+            msg += f"\n最近结束：{recent_finished}"
         if self.state.last_error:
             msg += f"\n最近错误：{self.state.last_error}"
         yield event.plain_result(msg)
@@ -1830,9 +2953,10 @@ class ChessArenaPlugin(Star):
         except Exception as exc:  # noqa: BLE001
             yield event.plain_result(f"棋擂台在线检查异常：{exc}")
 
-    async def _challenge_bot(self, opponent: dict[str, Any], side: str) -> str:
+    async def _challenge_bot(self, opponent: dict[str, Any], side: str, game: str = "") -> str:
         opponent_id = self._bot_id(opponent)
-        payload = {"opponent_bot_id": opponent_id, "side": side}
+        normalized_game = self._normalize_game(game)
+        payload = {"opponent_bot_id": opponent_id, "side": side, "game": normalized_game}
         _base, status, data, text = await self._api_json(
             "POST",
             "/api/challenges",
@@ -2004,6 +3128,12 @@ class ChessArenaPlugin(Star):
             self._sse_task.cancel()
             try:
                 await self._sse_task
+            except asyncio.CancelledError:
+                pass
+        if self._cardroom_task and not self._cardroom_task.done():
+            self._cardroom_task.cancel()
+            try:
+                await self._cardroom_task
             except asyncio.CancelledError:
                 pass
         if self._session and not self._session.closed:

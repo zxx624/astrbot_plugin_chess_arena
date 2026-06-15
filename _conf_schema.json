@@ -5,6 +5,12 @@
     "hint": "平台 HTTP/SSE Base URL，不要以 / 结尾",
     "default": "https://gulu624.icu"
   },
+  "card_arena_base": {
+    "description": "CardRoom 斗地主沙箱地址",
+    "type": "string",
+    "hint": "仅供 card_arena_* 斗地主工具使用，默认 9191 沙箱；不会影响 arena_base 的正式象棋/围棋链路。",
+    "default": "http://127.0.0.1:9191"
+  },
   "arena_fallback_bases": {
     "description": "备用平台地址",
     "type": "string",
@@ -22,6 +28,22 @@
     "type": "bool",
     "hint": "启动时 POST /api/bots/register 获取 token 并尝试保存到 AstrBot runtime config",
     "default": true
+  },
+  "enabled_games": {
+    "description": "启用的游戏类型",
+    "type": "string",
+    "hint": "多个游戏用英文逗号分隔，例如 xiangqi,go。这里只放已经接入双人对局主流程的棋类；斗地主后续会用独立三人房间工具。",
+    "default": "xiangqi,go"
+  },
+  "default_game": {
+    "description": "默认游戏类型",
+    "type": "string",
+    "hint": "默认用于 LLM 工具查询/挑战的游戏类型。当前支持 xiangqi/go。",
+    "default": "xiangqi",
+    "options": [
+      "xiangqi",
+      "go"
+    ]
   },
   "commentary_enabled": {
     "description": "走棋时生成台词",
@@ -170,5 +192,88 @@
     "type": "bool",
     "hint": "预留字段；默认仅记录日志和响应命令，不主动向聊天发送事件",
     "default": false
+  },
+  "go_engine_enabled": {
+    "description": "启用 Go9 后端引擎适配器",
+    "type": "bool",
+    "hint": "默认关闭。开启后围棋自己的回合会用当前 Bot token 调用 /api/go9/analyze；失败或非法走法自动回退当前 random/pass。",
+    "default": false
+  },
+  "go_engine_endpoint": {
+    "description": "Go9 引擎分析接口",
+    "type": "string",
+    "hint": "默认 8787 live 的 POST /api/go9/analyze；需要 Bot Bearer token。不要填 /spectator。",
+    "default": "http://127.0.0.1:8787/api/go9/analyze"
+  },
+  "go_engine_timeout_sec": {
+    "description": "Go9 引擎超时秒数",
+    "type": "int",
+    "hint": "单次调用 /api/go9/analyze 的超时；超时会回退 random/pass。",
+    "default": 5
+  },
+  "go_engine_fallback_random": {
+    "description": "Go9 引擎失败时随机兜底",
+    "type": "bool",
+    "hint": "默认开启，保持现有 random/pass 行为；关闭时引擎失败直接 pass。",
+    "default": true
+  },
+  "cardroom_enabled": {
+    "description": "启用斗地主 CardRoom Bot 轮询",
+    "type": "bool",
+    "hint": "开启后按 cardroom_seats 配置轮询 seat 私有 view/legal-actions 并自动提交最小合法动作；不会影响象棋/围棋 SSE。",
+    "default": false
+  },
+  "cardroom_poll_interval": {
+    "description": "CardRoom Bot 轮询间隔秒数",
+    "type": "int",
+    "default": 5
+  },
+  "cardroom_base_url": {
+    "description": "CardRoom 斗地主 API 地址",
+    "type": "string",
+    "hint": "默认 8787；只调用 /view、/legal-actions、/actions，不调用 spectator 做决策。",
+    "default": "http://127.0.0.1:8787"
+  },
+  "cardroom_seats": {
+    "description": "CardRoom seat/token 映射",
+    "type": "text",
+    "hint": "JSON数组，如 [{\"room_id\":\"cardroom_x\",\"seat\":0,\"token\":\"seat_x\"}]。每个 seat 只用自己的 token。",
+    "default": "[]"
+  },
+  "cardroom_prompt_decision_enabled": {
+    "description": "CardRoom 使用 Prompt 审核决策接口",
+    "type": "bool",
+    "hint": "开启后自动轮询和 card_arena_prompt_decision 走 /prompt-decision：网站端基于 private view + legal-actions 审核，非法会重试并回退；不调用 spectator。",
+    "default": true
+  },
+  "cardroom_prompt_max_retries": {
+    "description": "CardRoom Prompt 决策最大重试次数",
+    "type": "int",
+    "hint": "0-5，超过后网站端使用内置 fallback（能 pass 优先 pass，否则最小合法出牌）。",
+    "default": 5
+  },
+  "cardroom_llm_decision_enabled": {
+    "description": "CardRoom 使用插件侧 LLM 上下文决策",
+    "type": "bool",
+    "hint": "默认关闭。开启后插件会基于 private view + legal-actions 构造上下文，让 AstrBot 当前 LLM 选择候选动作；失败自动回退最小合法动作，不调用 spectator。",
+    "default": false
+  },
+  "cardroom_context_enabled": {
+    "description": "CardRoom 保留 LLM 决策上下文",
+    "type": "bool",
+    "hint": "仅 cardroom_llm_decision_enabled 开启时生效；保留最近回合摘要给 LLM 参考，不持久化。",
+    "default": true
+  },
+  "cardroom_context_max_history": {
+    "description": "CardRoom LLM 上下文历史条数",
+    "type": "int",
+    "hint": "仅 cardroom_llm_decision_enabled 开启时生效；建议 3-10。",
+    "default": 6
+  },
+  "cardroom_persona_prompt": {
+    "description": "CardRoom 斗地主人格提示词",
+    "type": "text",
+    "hint": "用于插件侧 LLM 上下文决策的 system prompt，可给咕噜/发作设置不同风格；默认不启用 LLM 决策。",
+    "default": "你是斗地主 Bot。出牌自然、有一点胜负欲。"
   }
 }

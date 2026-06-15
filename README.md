@@ -19,6 +19,8 @@ AstrBot 棋擂台 Arena 客户端插件。它把一个 AstrBot 实例接入 **�
 - **日志降噪**：默认把 SSE/事件/选步/提交走法等日常日志降到 DEBUG；需要排查时打开 `verbose_logging`。
 - **QQ/聊天命令**：支持查看状态、检查在线、手动发起挑战。
 - **LLM Tools（v3.4.0）**：允许对话模型以工具方式查询状态/找对手/发起挑战/审批待确认挑战，默认不暴露完整 token。
+- **Go9 后端引擎（v3.5.0）**：可选调用平台 `/api/go9/analyze`，默认关闭；失败时回退原随机/pass。
+- **斗地主 CardRoom（v3.5.0）**：可选轮询私有 seat view/legal-actions，支持 Prompt 审核和插件侧 LLM 上下文决策，默认关闭。
 
 ## 安装
 
@@ -213,6 +215,17 @@ LLM 只用于生成走棋台词，不参与棋力决策。
 - 操作类工具默认关闭，确认当前模型工具调用可靠后再开启 `llm_tools_allow_actions=true`。
 - `owner_decision` 不传 `challenge_id` 时默认处理最新一条待确认挑战。
 
+
+## Go9 与斗地主实验功能（v3.5.0）
+
+这些功能默认关闭，不影响现有象棋/围棋 SSE 主链路。
+
+- `go_engine_enabled=false`：不开启 Go9 后端引擎；开启后只对围棋自己的回合调用 `go_engine_endpoint`。
+- Go9 引擎请求只使用 `Authorization: Bearer <token>` 和 `Content-Type: application/json`，不会发送 `X-Bot-Token`。
+- `cardroom_enabled=false`：不开启斗地主 CardRoom 自动轮询。
+- `cardroom_llm_decision_enabled=false`：不开启插件侧 LLM 上下文决策。
+- 斗地主决策只使用 private `view` + `legal-actions` + `/actions` 或 `/prompt-decision`，不会用 `/spectator` 做 Bot 决策。
+- 所有失败路径都会回退到安全兜底，不阻塞主 SSE。
 ## 日志说明
 
 从 `v3.2.2` 开始，插件默认减少 INFO 日志。
@@ -427,7 +440,7 @@ python3 -m json.tool _conf_schema.json >/dev/null
 发布前敏感信息检查示例：
 
 ```bash
-grep -RInE '(sk-<token-pattern>|AKID<secret-id-pattern>|<server-password>|<api-token>|<bot-token>|http://<public-ip>)' . \
+grep -RInE '(<openai-token-pattern>|AKID<secret-id-pattern>|<server-password>|<api-token>|<bot-token>|http://<public-ip>)' . \
   --exclude-dir=.git \
   --exclude='*.pyc'
 ```

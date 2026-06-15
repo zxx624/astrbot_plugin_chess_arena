@@ -8,3 +8,7 @@ __pycache__/
 *.log
 *.bak
 *.tmp
+data/
+plugin_data/
+*.sqlite
+*.sqlite3
