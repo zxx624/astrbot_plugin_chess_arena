@@ -1023,13 +1023,8 @@ class ChessArenaPlugin(Star):
             f"seat{s}": view.get("opponent_hand_counts", {}).get(str(s), "?")
             for s in (0, 1, 2) if str(s) != session.seat
         }
-        groups = legal.get("candidate_groups") or {}
-        group_lines: list[str] = []
-        for k, v in groups.items():
-            if k == "rocket_cards":
-                continue
-            items = v if isinstance(v, list) else ([v] if v else [])
-            group_lines.append(f"  {k}: {items[:8]}")
+        action_candidates = self._cardroom_action_candidates(legal)
+        candidate_json = json.dumps(action_candidates, ensure_ascii=False, separators=(",", ":"))
         history_text = (
             "\n".join(f"- {h}" for h in session.history_summary[-6:])
             or "（新牌局）"
@@ -1043,11 +1038,45 @@ class ChessArenaPlugin(Star):
             f"上一手：{view.get('last_play') or '开局'}\n"
             f"pass 计数：{view.get('pass_count', 0)}\n"
             f"你能 pass：{legal.get('can_pass', False)}\n"
-            f"\n合法候选：\n" + "\n".join(group_lines)
+            f"\n完整合法动作（只能返回其中 action_id）：\n{candidate_json}"
             + f"\n\n最近对局摘要：\n{history_text}\n\n"
-            f"请以 JSON 输出你的决策。"
+            '只输出 JSON：{"candidates":[{"action_id":"...","reason":"...","speech":"..."}]}'
         )
 
+    @staticmethod
+    def _cardroom_action_candidates(legal: dict[str, Any]) -> list[dict[str, Any]]:
+        """Build the complete deterministic action catalog from server legal actions."""
+        groups = legal.get("candidate_groups") if isinstance(legal.get("candidate_groups"), dict) else {}
+        out: list[dict[str, Any]] = []
+        for family, value in groups.items():
+            if family in {"rocket", "rocket_cards"} or not value:
+                continue
+            for raw_cards in value if isinstance(value, list) else [value]:
+                cards = [raw_cards] if isinstance(raw_cards, str) else list(raw_cards or [])
+                cards = [str(card) for card in cards]
+                out.append({"action_id": "play:" + ",".join(cards), "action": "play", "cards": cards, "family": family})
+        if groups.get("rocket") and groups.get("rocket_cards"):
+            cards = [str(card) for card in groups.get("rocket_cards") or []]
+            out.append({"action_id": "play:" + ",".join(cards), "action": "play", "cards": cards, "family": "rocket"})
+        if legal.get("can_pass"):
+            out.append({"action_id": "pass", "action": "pass", "cards": [], "family": "pass"})
+        return out
+
+    def _resolve_cardroom_llm_candidates(self, raw_candidates: list[dict[str, Any]], legal: dict[str, Any]) -> list[dict[str, Any]]:
+        catalog = {item["action_id"]: item for item in self._cardroom_action_candidates(legal)}
+        resolved: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for raw in raw_candidates:
+            action_id = str(raw.get("action_id") or "").strip()
+            if action_id in seen or action_id not in catalog:
+                continue
+            seen.add(action_id)
+            selected = dict(catalog[action_id])
+            selected["reason"] = str(raw.get("reason") or "astrbot_llm")[:500]
+            selected["speech"] = str(raw.get("speech") or "")[:300]
+            selected["source"] = "astrbot_llm"
+            resolved.append(selected)
+        return resolved
     @staticmethod
     def _parse_llm_candidates(raw: str) -> list[dict[str, Any]]:
         """从 LLM 输出提取 JSON candidates，最少返回一条 pass。"""
@@ -1127,7 +1156,7 @@ class ChessArenaPlugin(Star):
                 timeout=15,
             )
             raw = str(getattr(response, "completion_text", response) or "")
-            candidates = self._parse_llm_candidates(raw)
+            candidates = self._resolve_cardroom_llm_candidates(self._parse_llm_candidates(raw), legal)
             logger.info(
                 "[ChessArena] CardRoom LLM decide room=%s seat=%s turn=%d candidates=%d",
                 session.room_id,
@@ -1146,21 +1175,36 @@ class ChessArenaPlugin(Star):
 
     @staticmethod
     def _select_cardroom_action(view: dict[str, Any], legal: dict[str, Any]) -> dict[str, Any]:
+        """Combination-first deterministic fallback when no LLM choice is usable."""
         groups = legal.get("candidate_groups") if isinstance(legal.get("candidate_groups"), dict) else {}
-        for key in ("singles", "pairs", "triples", "triple_with_single", "triple_with_pair", "straights", "consecutive_pairs", "bombs"):
-            items = groups.get(key)
-            if not items:
-                continue
-            cards = items[0]
+        leading = not view.get("last_play")
+        lead_order = (
+            "planes", "plane_with_pairs", "plane_with_singles", "consecutive_pairs", "straights",
+            "triple_with_pair", "triple_with_single", "four_with_two_pairs", "four_with_two_singles",
+            "triples", "pairs", "singles", "bombs", "rocket",
+        )
+        follow_order = (
+            "triple_with_pair", "triple_with_single", "pairs", "triples", "consecutive_pairs",
+            "straights", "planes", "plane_with_pairs", "plane_with_singles", "singles", "bombs", "rocket",
+        )
+        if not leading and legal.get("can_pass"):
+            non_special = any(groups.get(name) for name in lead_order if name not in {"bombs", "rocket"})
+            if not non_special:
+                return {"action_id": "pass", "action": "pass", "cards": [], "reason": "astrbot_keep_bomb_pass"}
+        order = lead_order if leading else follow_order
+        for family in order:
+            if family == "rocket":
+                cards = list(groups.get("rocket_cards") or []) if groups.get("rocket") else []
+            else:
+                items = groups.get(family) or []
+                cards = items[0] if items else []
             if isinstance(cards, str):
                 cards = [cards]
-            return {"action": "play", "cards": list(cards), "reason": f"astrbot_min_{key}"}
-        if groups.get("rocket") and groups.get("rocket_cards"):
-            return {"action": "play", "cards": list(groups.get("rocket_cards") or []), "reason": "astrbot_min_rocket"}
+            if cards:
+                cards = [str(card) for card in cards]
+                return {"action_id": "play:" + ",".join(cards), "action": "play", "cards": cards, "reason": f"astrbot_combo_{family}"}
         if legal.get("can_pass"):
-            return {"action": "pass", "cards": [], "reason": "astrbot_no_legal_play"}
-        # Fairness rule: only act from legal-actions candidates; do not invent a
-        # play directly from my_hand when legal-actions has no playable group.
+            return {"action_id": "pass", "action": "pass", "cards": [], "reason": "astrbot_keep_hand_pass"}
         return {"action": "pass", "cards": [], "reason": "astrbot_no_legal_action"}
 
     def _match_url(self, match_id: Any) -> str:
