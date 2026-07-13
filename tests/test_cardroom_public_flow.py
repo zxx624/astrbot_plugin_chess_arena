@@ -136,6 +136,41 @@ class CardRoomPublicFlowTests(unittest.TestCase):
                 self.assertEqual(selected["action"], "play")
                 self.assertEqual(selected["cards"], cards)
 
+    def test_real_turn_path_submits_combo_with_default_speech(self):
+        plugin = make_plugin()
+        plugin._cardroom_sessions = {}
+        plugin.cardroom_persona_prompt = "test persona"
+        plugin.cardroom_llm_decision_enabled = False
+        plugin.cardroom_prompt_decision_enabled = True
+        plugin.cardroom_prompt_max_retries = 5
+        straight = ["3S", "4S", "5S", "6S", "7S"]
+        plugin._card_api_json = AsyncMock(side_effect=[
+            (200, {
+                "phase": "playing",
+                "my_hand": straight,
+                "last_play": None,
+                "players": [],
+            }, "{}"),
+            (200, {
+                "is_my_turn": True,
+                "can_pass": False,
+                "candidate_groups": {"straights": [straight]},
+            }, "{}"),
+            (200, {"accepted": True}, "{}"),
+        ])
+
+        asyncio.run(plugin._cardroom_maybe_act({
+            "room_id": "room-live",
+            "seat": "0",
+            "seat_token": "seat-secret",
+        }))
+
+        submit = plugin._card_api_json.await_args_list[2]
+        self.assertEqual(submit.args[:2], ("POST", "/api/card-rooms/room-live/prompt-decision"))
+        candidate = submit.kwargs["json_payload"]["candidates"][0]
+        self.assertEqual(candidate["cards"], straight)
+        self.assertEqual(candidate["speech"], "我出这手。")
+
     def test_persisted_pool_binding_is_restored_after_restart(self):
         plugin = make_plugin()
         raw = json.dumps([{

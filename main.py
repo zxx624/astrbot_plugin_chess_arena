@@ -1015,6 +1015,18 @@ class ChessArenaPlugin(Star):
             self.config["cardroom_pool_bindings"] = json.dumps(next_bindings, ensure_ascii=False, separators=(",", ":"))
             await self._save_runtime_config()
 
+    @staticmethod
+    def _cardroom_default_speech(selected: dict[str, Any]) -> str:
+        existing = str(selected.get("speech") or "").strip()
+        if existing:
+            return existing[:300]
+        if str(selected.get("action") or "").lower() == "pass":
+            return "这手先过。"
+        cards = [str(card) for card in selected.get("cards") or []]
+        if cards:
+            return "我出这手。"
+        return "轮到我了。"
+
     async def _cardroom_poll_loop(self) -> None:
         while not self._stopping.is_set():
             try:
