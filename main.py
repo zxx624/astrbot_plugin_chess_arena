@@ -1238,7 +1238,7 @@ class ChessArenaPlugin(Star):
         try:
             obj = json.loads(raw.strip())
         except json.JSONDecodeError:
-            m2 = _re.search(r'\{[^{}]*"action"[^{}]*\}', raw)
+            m2 = _re.search(r'\{[^{}]*"action(?:_id)?"[^{}]*\}', raw)
             if m2:
                 try:
                     obj = json.loads(m2.group(0))
@@ -1246,9 +1246,9 @@ class ChessArenaPlugin(Star):
                     return [{"action": "pass", "cards": [], "reason": "parse_failed", "speech": ""}]
             else:
                 return [{"action": "pass", "cards": [], "reason": "parse_failed", "speech": ""}]
-        if isinstance(obj, dict) and "candidates" in obj:
-            return obj["candidates"]
-        if isinstance(obj, dict) and "action" in obj:
+        if isinstance(obj, dict) and isinstance(obj.get("candidates"), list):
+            return [item for item in obj["candidates"] if isinstance(item, dict)]
+        if isinstance(obj, dict) and ("action_id" in obj or "action" in obj):
             return [obj]
         return [{"action": "pass", "cards": [], "reason": "parse_failed", "speech": ""}]
 

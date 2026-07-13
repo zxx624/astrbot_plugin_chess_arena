@@ -121,6 +121,17 @@ class CardRoomPublicFlowTests(unittest.TestCase):
         self.assertIn("candidates", prompt)
         self.assertIn("不能自造或改写 cards", prompt)
 
+    def test_llm_parser_accepts_single_action_id_object(self):
+        parsed = plugin_mod.ChessArenaPlugin._parse_llm_candidates(
+            '{"action_id":"play:3S","reason":"试探","speech":"出一张。"}'
+        )
+        self.assertEqual(parsed[0]["action_id"], "play:3S")
+
+        fenced = plugin_mod.ChessArenaPlugin._parse_llm_candidates(
+            '```json\n{"action_id":"pass","reason":"保留大牌","speech":"过。"}\n```'
+        )
+        self.assertEqual(fenced[0]["action_id"], "pass")
+
     def test_combination_first_fallback_plays_supported_multi_card_families(self):
         plugin = make_plugin()
         cases = [
