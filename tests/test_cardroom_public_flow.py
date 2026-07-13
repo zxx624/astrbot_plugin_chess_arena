@@ -1,6 +1,7 @@
 import asyncio
 import json
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock
@@ -181,6 +182,64 @@ class CardRoomPublicFlowTests(unittest.TestCase):
         candidate = submit.kwargs["json_payload"]["candidates"][0]
         self.assertEqual(candidate["cards"], straight)
         self.assertEqual(candidate["speech"], "我出这手。")
+
+    def test_future_next_action_at_returns_before_legal_or_llm(self):
+        plugin = make_plugin()
+        plugin._cardroom_sessions = {}
+        plugin._cardroom_llm_decide = AsyncMock()
+        plugin._card_api_json = AsyncMock(return_value=(200, {
+            "phase": "playing",
+            "is_my_turn": True,
+            "next_action_at": time.time() + 5,
+            "retry_after_ms": 5000,
+        }, "{}"))
+
+        asyncio.run(plugin._cardroom_maybe_act({
+            "room_id": "room-paced",
+            "seat": "0",
+            "seat_token": "seat-secret",
+        }))
+
+        self.assertEqual(plugin._card_api_json.await_count, 1)
+        plugin._cardroom_llm_decide.assert_not_awaited()
+        self.assertEqual(plugin._cardroom_sessions, {})
+
+    def test_action_paced_submit_does_not_mutate_session_history(self):
+        plugin = make_plugin()
+        plugin._cardroom_sessions = {}
+        plugin.cardroom_persona_prompt = "test persona"
+        plugin.cardroom_llm_decision_enabled = False
+        plugin.cardroom_prompt_decision_enabled = True
+        plugin.cardroom_prompt_max_retries = 5
+        plugin._card_api_json = AsyncMock(side_effect=[
+            (200, {
+                "phase": "playing",
+                "my_hand": ["3S"],
+                "last_play": None,
+                "players": [],
+            }, "{}"),
+            (200, {
+                "is_my_turn": True,
+                "can_pass": False,
+                "candidate_groups": {"singles": ["3S"]},
+            }, "{}"),
+            (429, {"detail": {
+                "code": "action_paced",
+                "retry_after_ms": 2500,
+                "next_action_at": time.time() + 2.5,
+            }}, "paced"),
+        ])
+
+        asyncio.run(plugin._cardroom_maybe_act({
+            "room_id": "room-race",
+            "seat": "0",
+            "seat_token": "seat-secret",
+        }))
+
+        session = plugin._cardroom_sessions["room-race:0"]
+        self.assertEqual(session.turn_count, 0)
+        self.assertEqual(session.history_summary, [])
+        self.assertEqual(session.last_errors, [])
 
     def test_persisted_pool_binding_is_restored_after_restart(self):
         plugin = make_plugin()

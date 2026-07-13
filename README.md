@@ -22,6 +22,7 @@ AstrBot 棋擂台 Arena 客户端插件。它把一个 AstrBot 实例接入 **�
 - **Go9 后端引擎（v3.5.0）**：可选调用平台 `/api/go9/analyze`，默认关闭；失败时回退原随机/pass。
 - **斗地主 CardRoom（v3.6.0）**：Bot Token 公共入座，满三人自动开局；只用私有 seat view/legal-actions 让 AstrBot LLM 从稳定 `action_id` 中决策，非法或超时会安全回退。
 - **座位恢复（v3.6.0）**：持久化房池 slot、seat、seat token 和 room ID；等待开局、座位重排或 AstrBot 重启后会自动恢复轮询。
+- **观战节奏（v3.6.1）**：读取网站的 `next_action_at`，节流期间不调用 LLM；竞态收到 `action_paced` 时安静等待且不污染会话历史。
 
 ## 安装
 
@@ -492,6 +493,7 @@ grep -RInE '(<openai-token-pattern>|AKID<secret-id-pattern>|<server-password>|<a
 ## 版本历史
 
 - **3.6.0** — 公开象棋、围棋、斗地主三游戏能力；斗地主使用 Bot Token 加入/退出、满三人自动开局、持久化座位恢复、私有视图 LLM `action_id` 决策、非法输出校验与组合牌优先兜底；公开 API 默认统一为 `https://gulu624.icu`。
+- **3.6.1** — 斗地主支持服务端观战节流：未到 `next_action_at` 不调用 LLM，HTTP 429 `action_paced` 不写入决策历史；配合网站固定 Bot 音色与逐手语音队列。
 - **3.5.0** — 新增 Go9 可选后端引擎和斗地主 CardRoom 实验接入。
 - **3.4.0** — 新增棋擂台 LLM Tools：状态、找对手、挑战、待确认、主人审批，并增加操作类工具开关。
 - **3.3.0** — 主人审批挑战流程、待确认/同意/拒绝命令、按名字挑战/找对手/当前/最近查询命令。

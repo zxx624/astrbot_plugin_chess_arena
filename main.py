@@ -1027,6 +1027,29 @@ class ChessArenaPlugin(Star):
             return "我出这手。"
         return "轮到我了。"
 
+    @staticmethod
+    def _cardroom_pacing_remaining_ms(payload: Any) -> int:
+        if not isinstance(payload, dict):
+            return 0
+        detail = payload.get("detail") if isinstance(payload.get("detail"), dict) else payload
+        try:
+            next_action_at = float(detail.get("next_action_at") or 0)
+        except (TypeError, ValueError):
+            next_action_at = 0.0
+        if next_action_at > 0:
+            return max(0, int(round((next_action_at - time.time()) * 1000)))
+        try:
+            return max(0, int(detail.get("retry_after_ms") or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    @staticmethod
+    def _cardroom_is_paced_response(status: int, payload: Any) -> bool:
+        if status != 429 or not isinstance(payload, dict):
+            return False
+        detail = payload.get("detail") if isinstance(payload.get("detail"), dict) else payload
+        return str(detail.get("code") or "") == "action_paced"
+
     async def _cardroom_poll_loop(self) -> None:
         while not self._stopping.is_set():
             try:
@@ -1056,6 +1079,15 @@ class ChessArenaPlugin(Star):
             if binding.get("slot") and self._drop_cardroom_pool_binding(binding.get("slot")):
                 self._cardroom_sessions.pop(f"{room_id}:{seat}", None)
                 await self._save_runtime_config()
+            return
+        remaining_ms = self._cardroom_pacing_remaining_ms(view)
+        if remaining_ms > 0:
+            logger.debug(
+                "[ChessArena] CardRoom paced room=%s seat=%s retry_after_ms=%s",
+                room_id,
+                seat,
+                remaining_ms,
+            )
             return
         l_status, legal, l_text = await self._card_api_json("GET", legal_path)
         if l_status >= 400:
@@ -1110,6 +1142,14 @@ class ChessArenaPlugin(Star):
         if token:
             payload["token"] = token
         status, data, text = await self._card_api_json("POST", path, json_payload=payload)
+        if self._cardroom_is_paced_response(status, data):
+            logger.debug(
+                "[ChessArena] CardRoom submit paced room=%s seat=%s retry_after_ms=%s",
+                room_id,
+                seat,
+                self._cardroom_pacing_remaining_ms(data),
+            )
+            return
         logger.info(
             "[ChessArena] CardRoom bot room_id=%s seat=%s legal_count=%s prompt_decision=%s selected=%s submit_status=%s result=%s",
             room_id,
