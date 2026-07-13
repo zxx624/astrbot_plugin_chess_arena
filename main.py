@@ -71,16 +71,17 @@ class ChessArenaPlugin(Star):
         self.card_arena_base = str(
             self.config.get("cardroom_base_url")
             or self.config.get("card_arena_base")
-            or "http://127.0.0.1:8787"
+            or "https://gulu624.icu"
         ).rstrip("/")
-        self.cardroom_enabled = self._config_bool(self.config.get("cardroom_enabled"), default=False)
+        self.cardroom_enabled = self._config_bool(self.config.get("cardroom_enabled"), default=True)
         self.cardroom_poll_interval = max(1.0, float(self.config.get("cardroom_poll_interval") or 5))
         self.cardroom_prompt_decision_enabled = self._config_bool(self.config.get("cardroom_prompt_decision_enabled"), default=True)
         self.cardroom_prompt_max_retries = max(0, min(5, int(self.config.get("cardroom_prompt_max_retries") or 5)))
         self.cardroom_seats = self._parse_cardroom_seats(self.config.get("cardroom_seats"))
+        self.cardroom_pool_bindings = self._parse_cardroom_pool_bindings(self.config.get("cardroom_pool_bindings"))
 
-        # CardRoom LLM decision (default OFF -> min-legal)
-        self.cardroom_llm_decision_enabled = self._config_bool(self.config.get("cardroom_llm_decision_enabled"), default=False)
+        # CardRoom LLM decision (public default ON; invalid/timeout responses still fall back safely)
+        self.cardroom_llm_decision_enabled = self._config_bool(self.config.get("cardroom_llm_decision_enabled"), default=True)
         self.cardroom_context_enabled = self._config_bool(self.config.get("cardroom_context_enabled"), default=True)
         self.cardroom_context_max_history = max(1, int(self.config.get("cardroom_context_max_history") or 6))
         self.cardroom_persona_prompt = str(self.config.get("cardroom_persona_prompt") or "你是斗地主 Bot。出牌自然、有一点胜负欲。").strip()
@@ -240,13 +241,54 @@ class ChessArenaPlugin(Star):
                     seats.append({"room_id": room_id, "seat": seat, "token": token})
         return seats
 
-    _LEGAL_GAMES = {"xiangqi", "go"}
+    @staticmethod
+    def _parse_cardroom_pool_bindings(value: Any) -> list[dict[str, Any]]:
+        if value in (None, ""):
+            return []
+        if isinstance(value, str):
+            try:
+                raw = json.loads(value)
+            except json.JSONDecodeError:
+                raw = []
+        else:
+            raw = value
+        if isinstance(raw, dict):
+            raw = [raw]
+        bindings: list[dict[str, Any]] = []
+        if not isinstance(raw, list):
+            return bindings
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            try:
+                slot = max(1, min(5, int(item.get("slot") or 0)))
+            except (TypeError, ValueError):
+                continue
+            seat_token = str(item.get("seat_token") or item.get("token") or "").strip()
+            controller_id = str(item.get("controller_id") or "").strip()
+            if not seat_token or not controller_id:
+                continue
+            bindings.append({
+                "slot": slot,
+                "controller_id": controller_id[:160],
+                "seat": str(item.get("seat") if item.get("seat") is not None else "0"),
+                "seat_token": seat_token,
+                "room_id": str(item.get("room_id") or "").strip(),
+                "status": str(item.get("status") or "waiting").strip() or "waiting",
+            })
+        return bindings
+
+    _DUEL_GAMES = {"xiangqi", "go"}
+    _CAPABILITY_GAMES = {"xiangqi", "go", "doudizhu"}
     _GAME_ALIASES = {
         "xiangqi": "xiangqi",
         "象棋": "xiangqi",
         "中国象棋": "xiangqi",
         "chess": "xiangqi",
         "go": "go",
+        "doudizhu": "doudizhu",
+        "\u6597\u5730\u4e3b": "doudizhu",
+        "\u6597\u5730\u4e3b\u724c": "doudizhu",
         "围棋": "go",
         "围棋9路": "go",
         "9路围棋": "go",
@@ -257,11 +299,11 @@ class ChessArenaPlugin(Star):
         text = str(value or "").strip().lower()
         if not text:
             return ""
-        return cls._GAME_ALIASES.get(text, text if text in cls._LEGAL_GAMES else "")
+        return cls._GAME_ALIASES.get(text, text if text in cls._CAPABILITY_GAMES else "")
 
     def _parse_enabled_games(self, value: Any) -> list[str]:
-        if value is None or value == "":
-            raw_items: list[Any] = []
+        if value is None or (isinstance(value, str) and not value.strip()):
+            raw_items: list[Any] = ["xiangqi", "go", "doudizhu"]
         elif isinstance(value, str):
             text = value.strip()
             raw_items = []
@@ -294,11 +336,11 @@ class ChessArenaPlugin(Star):
             raw = getattr(self, "default_game", "xiangqi")
         game = self._game_alias_to_id(raw)
         enabled_games = list(getattr(self, "enabled_games", []) or [])
-        if game and game in enabled_games:
+        if game in self._DUEL_GAMES and game in enabled_games:
             return game
 
         fallback = self._game_alias_to_id(getattr(self, "default_game", "xiangqi"))
-        if fallback and fallback in enabled_games:
+        if fallback in self._DUEL_GAMES and fallback in enabled_games:
             return fallback
         return "xiangqi"
 
@@ -724,6 +766,22 @@ class ChessArenaPlugin(Star):
         display_name = self.effective_bot_name or controller_id
         return str(controller_id)[:160], str(display_name)[:80]
 
+    def _upsert_cardroom_pool_binding(self, binding: dict[str, Any]) -> None:
+        slot = int(binding.get("slot") or 0)
+        self.cardroom_pool_bindings = [item for item in self.cardroom_pool_bindings if int(item.get("slot") or 0) != slot]
+        self.cardroom_pool_bindings.append(dict(binding))
+        self.cardroom_pool_bindings.sort(key=lambda item: int(item.get("slot") or 0))
+        self.config["cardroom_pool_bindings"] = json.dumps(self.cardroom_pool_bindings, ensure_ascii=False, separators=(",", ":"))
+
+    def _drop_cardroom_pool_binding(self, slot: Any) -> bool:
+        slot_num = max(1, min(5, int(str(slot or "1").strip())))
+        before = len(self.cardroom_pool_bindings)
+        self.cardroom_pool_bindings = [item for item in self.cardroom_pool_bindings if int(item.get("slot") or 0) != slot_num]
+        changed = len(self.cardroom_pool_bindings) != before
+        if changed:
+            self.config["cardroom_pool_bindings"] = json.dumps(self.cardroom_pool_bindings, ensure_ascii=False, separators=(",", ":"))
+        return changed
+
     async def _card_tool_pool_status(self) -> str:
         try:
             status, data, text = await self._card_api_json("GET", "/api/card-rooms/pool")
@@ -754,10 +812,23 @@ class ChessArenaPlugin(Star):
         try:
             slot_num = max(1, min(5, int(str(slot or "1").strip())))
             controller_id, display_name = self._cardroom_controller_identity()
-            payload = {"controller_type": "astrbot", "controller_id": controller_id, "display_name": display_name}
-            status, data, text = await self._card_api_json("POST", f"/api/card-rooms/pool/{slot_num}/join", json_payload=payload)
+            payload = {"token": self.token, "display_name": display_name}
+            status, data, text = await self._card_api_json("POST", f"/api/card-rooms/pool/{slot_num}/join-token", json_payload=payload)
             if status >= 400:
                 return self._card_error_text(f"加入斗地主房间 {slot_num}", status, data, text)
+            seat_data = data.get("seat") if isinstance(data, dict) and isinstance(data.get("seat"), dict) else {}
+            binding = {
+                "slot": slot_num,
+                "controller_id": controller_id,
+                "seat": str(seat_data.get("seat") if seat_data.get("seat") is not None else "0"),
+                "seat_token": str(data.get("seat_token") or ""),
+                "room_id": str(data.get("room_id") or ""),
+                "status": str((data.get("slot") or {}).get("status") or "waiting"),
+            }
+            if not binding["seat_token"]:
+                return "加入斗地主房间失败：网站没有返回 seat token。"
+            self._upsert_cardroom_pool_binding(binding)
+            await self._save_runtime_config()
             slot_data = data.get("slot") if isinstance(data, dict) and isinstance(data.get("slot"), dict) else data
             msg = f"已加入斗地主房间 {slot_num}：{display_name}。"
             if isinstance(slot_data, dict):
@@ -771,28 +842,19 @@ class ChessArenaPlugin(Star):
     async def _card_tool_pool_leave(self, slot: Any) -> str:
         try:
             slot_num = max(1, min(5, int(str(slot or "1").strip())))
-            controller_id, display_name = self._cardroom_controller_identity()
-            payload = {"controller_type": "astrbot", "controller_id": controller_id, "display_name": display_name}
-            status, data, text = await self._card_api_json("POST", f"/api/card-rooms/pool/{slot_num}/leave", json_payload=payload)
+            payload = {"token": self.token}
+            status, data, text = await self._card_api_json("POST", f"/api/card-rooms/pool/{slot_num}/leave-token", json_payload=payload)
             if status >= 400:
                 return self._card_error_text(f"退出斗地主房间 {slot_num}", status, data, text)
+            if self._drop_cardroom_pool_binding(slot_num):
+                await self._save_runtime_config()
             return f"已退出斗地主房间 {slot_num}。\n" + await self._card_tool_pool_status()
         except Exception as exc:  # noqa: BLE001
             return f"退出斗地主房间失败：{exc}"
 
     async def _card_tool_pool_start(self, slot: Any) -> str:
-        try:
-            if not self.llm_tools_allow_actions:
-                return "斗地主开始需要先开启 llm_tools_allow_actions。"
-            slot_num = max(1, min(5, int(str(slot or "1").strip())))
-            status, data, text = await self._card_api_json("POST", f"/api/card-rooms/pool/{slot_num}/start", json_payload={})
-            if status >= 400:
-                return self._card_error_text(f"启动斗地主房间 {slot_num}", status, data, text)
-            slot_data = data.get("slot") if isinstance(data, dict) and isinstance(data.get("slot"), dict) else data
-            room_id = slot_data.get("room_id") if isinstance(slot_data, dict) else ""
-            return f"斗地主房间 {slot_num} 已启动。" + (f"\n牌局：{room_id}" if room_id else "")
-        except Exception as exc:  # noqa: BLE001
-            return f"启动斗地主房间失败：{exc}"
+        slot_num = max(1, min(5, int(str(slot or "1").strip())))
+        return f"斗地主房间 {slot_num} 满 3 人后会自动开局，无需管理员手动开始。"
 
     async def _card_tool_create_room(self, seed: int = 0, landlord_index: int = 0) -> str:
         try:
@@ -894,10 +956,70 @@ class ChessArenaPlugin(Star):
         except Exception as exc:  # noqa: BLE001
             return f"pass 失败：{exc}"
 
+    def _active_cardroom_bindings(self) -> list[dict[str, Any]]:
+        bindings = [dict(item) for item in self.cardroom_seats]
+        for item in self.cardroom_pool_bindings:
+            room_id = str(item.get("room_id") or "").strip()
+            if not room_id:
+                continue
+            bindings.append({
+                "slot": item.get("slot"),
+                "room_id": room_id,
+                "seat": item.get("seat"),
+                "token": item.get("seat_token"),
+            })
+        deduped: list[dict[str, Any]] = []
+        seen: set[tuple[str, str]] = set()
+        for binding in bindings:
+            key = (str(binding.get("room_id") or ""), str(binding.get("seat") or ""))
+            if key[0] and key not in seen:
+                seen.add(key)
+                deduped.append(binding)
+        return deduped
+
+    async def _cardroom_reconcile_pool_bindings(self) -> None:
+        if not self.cardroom_pool_bindings:
+            return
+        status, data, text = await self._card_api_json("GET", "/api/card-rooms/pool")
+        if status >= 400:
+            logger.warning("[ChessArena] CardRoom pool reconcile failed HTTP %s %s", status, text[:120])
+            return
+        slots = data.get("slots") if isinstance(data, dict) else None
+        if not isinstance(slots, list):
+            return
+        slot_map = {int(item.get("slot") or 0): item for item in slots if isinstance(item, dict)}
+        changed = False
+        next_bindings: list[dict[str, Any]] = []
+        for raw in self.cardroom_pool_bindings:
+            binding = dict(raw)
+            slot = slot_map.get(int(binding.get("slot") or 0))
+            if not slot:
+                next_bindings.append(binding)
+                continue
+            slot_status = str(slot.get("status") or "waiting")
+            seats = slot.get("seats") if isinstance(slot.get("seats"), list) else []
+            own = next((seat for seat in seats if isinstance(seat, dict) and str(seat.get("controller_id") or "") == str(binding.get("controller_id") or "")), None)
+            if slot_status == "finished" or (slot_status == "waiting" and own is None):
+                changed = True
+                continue
+            updated = dict(binding)
+            updated["status"] = slot_status
+            updated["room_id"] = str(slot.get("room_id") or "")
+            if own is not None:
+                updated["seat"] = str(own.get("seat") if own.get("seat") is not None else updated.get("seat") or "0")
+            if updated != binding:
+                changed = True
+            next_bindings.append(updated)
+        if changed:
+            self.cardroom_pool_bindings = next_bindings
+            self.config["cardroom_pool_bindings"] = json.dumps(next_bindings, ensure_ascii=False, separators=(",", ":"))
+            await self._save_runtime_config()
+
     async def _cardroom_poll_loop(self) -> None:
         while not self._stopping.is_set():
             try:
-                for binding in list(self.cardroom_seats):
+                await self._cardroom_reconcile_pool_bindings()
+                for binding in self._active_cardroom_bindings():
                     await self._cardroom_maybe_act(binding)
             except asyncio.CancelledError:
                 raise
@@ -908,7 +1030,7 @@ class ChessArenaPlugin(Star):
     async def _cardroom_maybe_act(self, binding: dict[str, Any]) -> None:
         room_id = str(binding.get("room_id") or "").strip()
         seat = self._card_parse_seat(binding.get("seat"))
-        token = str(binding.get("token") or "").strip()
+        token = str(binding.get("token") or binding.get("seat_token") or "").strip()
         if not room_id:
             return
         rid = quote(room_id, safe="")
@@ -917,6 +1039,11 @@ class ChessArenaPlugin(Star):
         v_status, view, v_text = await self._card_api_json("GET", view_path)
         if v_status >= 400:
             logger.warning("[ChessArena] CardRoom view failed room=%s seat=%s HTTP %s %s", room_id, seat, v_status, v_text[:120])
+            return
+        if isinstance(view, dict) and view.get("phase") == "finished":
+            if binding.get("slot") and self._drop_cardroom_pool_binding(binding.get("slot")):
+                self._cardroom_sessions.pop(f"{room_id}:{seat}", None)
+                await self._save_runtime_config()
             return
         l_status, legal, l_text = await self._card_api_json("GET", legal_path)
         if l_status >= 400:
@@ -1019,10 +1146,22 @@ class ChessArenaPlugin(Star):
     ) -> str:
         """构造每回合增量 user prompt，不重复完整规则。"""
         my_hand = view.get("my_hand") or []
-        opponent_counts = {
-            f"seat{s}": view.get("opponent_hand_counts", {}).get(str(s), "?")
-            for s in (0, 1, 2) if str(s) != session.seat
-        }
+        players = [item for item in view.get("players") or [] if isinstance(item, dict)]
+        opponent_counts: dict[str, Any] = {}
+        landlord_seat = str(view.get("landlord_seat") or "").strip()
+        for player in players:
+            seat_value = str(player.get("seat") if player.get("seat") is not None else "").strip()
+            if player.get("is_landlord") and seat_value:
+                landlord_seat = f"seat{seat_value}"
+            if seat_value and not player.get("is_me") and seat_value != session.seat:
+                opponent_counts[f"seat{seat_value}"] = player.get("hand_count", "?")
+        if not opponent_counts:
+            legacy_counts = view.get("opponent_hand_counts") if isinstance(view.get("opponent_hand_counts"), dict) else {}
+            opponent_counts = {
+                f"seat{s}": legacy_counts.get(str(s), "?")
+                for s in (0, 1, 2) if str(s) != session.seat
+            }
+        landlord_seat = landlord_seat or "?"
         action_candidates = self._cardroom_action_candidates(legal)
         candidate_json = json.dumps(action_candidates, ensure_ascii=False, separators=(",", ":"))
         history_text = (
@@ -1033,7 +1172,7 @@ class ChessArenaPlugin(Star):
             f"回合 #{session.turn_count + 1}\n\n"
             f"你的手牌：{my_hand}\n"
             f"其他玩家手牌数量：{opponent_counts}\n"
-            f"地主 seat：{view.get('landlord_seat', '?')}\n"
+            f"地主 seat：{landlord_seat}\n"
             f"当前回合 seat：{view.get('current_seat', '?')}\n"
             f"上一手：{view.get('last_play') or '开局'}\n"
             f"pass 计数：{view.get('pass_count', 0)}\n"
@@ -1435,6 +1574,7 @@ class ChessArenaPlugin(Star):
                 return None
             self.server_profile = self._extract_server_profile(data)
             await self._sync_server_challenge_policy(data)
+            await self._sync_server_enabled_games(data)
             self._routine_log("[ChessArena] token 验证成功，已拉取服务端 profile: %s", self._short(self.server_profile))
             return True
         except Exception as exc:  # noqa: BLE001
@@ -1474,6 +1614,7 @@ class ChessArenaPlugin(Star):
         payload: dict[str, Any] = {
             "name": self.bot_name,
             "is_public": True,
+            "enabled_games": list(self.enabled_games),
         }
         if include_client:
             payload.update({"client_type": "astrbot", "instance_name": self._instance_name()})
@@ -1494,6 +1635,9 @@ class ChessArenaPlugin(Star):
             value = source.get(key)
             if value is not None and str(value).strip():
                 profile[key] = str(value).strip()
+        enabled_games = source.get("enabled_games")
+        if isinstance(enabled_games, list):
+            profile["enabled_games"] = [str(game) for game in enabled_games]
         return profile
 
     @staticmethod
@@ -1537,6 +1681,31 @@ class ChessArenaPlugin(Star):
         except Exception as exc:  # noqa: BLE001
             logger.warning("[ChessArena] 同步挑战审批策略异常，不影响启动: %s", exc)
 
+    async def _sync_server_enabled_games(self, profile_response: Any = None) -> None:
+        source = self._response_source(profile_response) if profile_response is not None else self.server_profile
+        current = source.get("enabled_games") if isinstance(source, dict) else None
+        current_games = [str(game) for game in current] if isinstance(current, list) else []
+        expected = list(self.enabled_games)
+        if current_games == expected:
+            return
+        try:
+            _base, status, text = await self._request_text_with_fallback(
+                "PATCH",
+                "/api/bots/me",
+                json_payload={"enabled_games": expected},
+                headers=self._auth_headers(),
+                timeout=aiohttp.ClientTimeout(total=10),
+            )
+            if status >= 400:
+                logger.warning("[ChessArena] failed to sync enabled games: HTTP %s %s", status, text[:200])
+                return
+            data = json.loads(text) if text else {}
+            synced = self._extract_server_profile(data)
+            if synced:
+                self.server_profile.update(synced)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[ChessArena] enabled games sync failed; SSE will continue: %s", exc)
+
     def _profile_value(self, key: str, local_default: str = "") -> str:
         value = self.server_profile.get(key)
         if value is not None and str(value).strip():
@@ -1557,7 +1726,8 @@ class ChessArenaPlugin(Star):
 
     async def _save_registration_to_runtime_config(self, token: str) -> None:
         """把自动注册结果写回 AstrBot 插件 runtime config，便于打开配置页直接看到 token。"""
-        paths = self._candidate_runtime_config_paths()
+        env_path = os.environ.get("CHESS_ARENA_CONFIG_PATH") or os.environ.get("ASTRBOT_PLUGIN_CHESS_ARENA_CONFIG")
+        paths = [Path(env_path)] if env_path else [self._instance_runtime_config_path()]
         if not paths:
             logger.warning("[ChessArena] 未找到 runtime config 路径，无法自动写回 token=%s", self._token_hint(token))
             return
@@ -1577,6 +1747,9 @@ class ChessArenaPlugin(Star):
         if not wrote:
             logger.warning("[ChessArena] token 自动写回失败，请手动复制到 WebUI 配置。最后错误: %s", last_error)
 
+    async def _save_runtime_config(self) -> None:
+        await self._save_registration_to_runtime_config(self.token)
+
     def _runtime_config_payload(self, token: str) -> dict[str, Any]:
         data = dict(self.config)
         data.update({
@@ -1592,6 +1765,7 @@ class ChessArenaPlugin(Star):
             "llm_tools_allow_actions": self.llm_tools_allow_actions,
             "default_game": self.default_game,
             "enabled_games": ",".join(self.enabled_games),
+            "cardroom_pool_bindings": json.dumps(getattr(self, "cardroom_pool_bindings", []), ensure_ascii=False, separators=(",", ":")),
             "auto_accept_challenges": self.auto_accept_challenges,
             "challenge_decision_mode": self.challenge_decision_mode,
             "challenge_policy": self.server_challenge_policy,

@@ -1,7 +1,7 @@
 name: astrbot_plugin_chess_arena
 display_name: 棋擂台 Arena 客户端
 author: Hermes
-version: 3.6.0-rc.1
-desc: 连接楚河 Bot 棋擂台平台 SSE，自动注册、主人审批挑战、合法走棋、LLM 台词和 LLM Tools 的 AstrBot 插件。
+version: 3.6.0
+desc: 接入楚河 Bot 棋擂台的象棋、围棋和斗地主，支持 SSE、合法走棋、LLM 决策与台词的 AstrBot 插件。
 repo: "https://github.com/zxx624/astrbot_plugin_chess_arena"
 astrbot_version: ">=4.16,<5"

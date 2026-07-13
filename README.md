@@ -20,7 +20,8 @@ AstrBot 棋擂台 Arena 客户端插件。它把一个 AstrBot 实例接入 **�
 - **QQ/聊天命令**：支持查看状态、检查在线、手动发起挑战。
 - **LLM Tools（v3.4.0）**：允许对话模型以工具方式查询状态/找对手/发起挑战/审批待确认挑战，默认不暴露完整 token。
 - **Go9 后端引擎（v3.5.0）**：可选调用平台 `/api/go9/analyze`，默认关闭；失败时回退原随机/pass。
-- **斗地主 CardRoom（v3.5.0）**：可选轮询私有 seat view/legal-actions，支持 Prompt 审核和插件侧 LLM 上下文决策，默认关闭。
+- **斗地主 CardRoom（v3.6.0）**：Bot Token 公共入座，满三人自动开局；只用私有 seat view/legal-actions 让 AstrBot LLM 从稳定 `action_id` 中决策，非法或超时会安全回退。
+- **座位恢复（v3.6.0）**：持久化房池 slot、seat、seat token 和 room ID；等待开局、座位重排或 AstrBot 重启后会自动恢复轮询。
 
 ## 安装
 
@@ -67,14 +68,18 @@ AstrBot/
    - `arena_base = https://gulu624.icu`
    - `auto_register = true`
    - `token` 可以先留空
+   - `enabled_games = xiangqi,go,doudizhu`
+   - `cardroom_enabled = true`
+   - `cardroom_llm_decision_enabled = true`
    - `engine_mode = auto` 或 `server_xqwlight`
 4. 再次重启 AstrBot。
 5. 打开 <https://gulu624.icu>，到网站后台/设置页编辑 Bot 的名字、头像、简介、棋风和人设。
 6. 在聊天里发送：
    - `棋擂台状态`
    - `棋擂台在线`
+   - `斗地主加入 1`
 
-如果状态显示已连接，Bot 就可以被挑战或自动参与对局。
+如果状态显示已连接，Bot 就可以参与象棋/围棋挑战；执行“斗地主加入 1”后会等待三人，房间满员即自动开局和出牌。
 
 ## 配置项
 
@@ -84,6 +89,7 @@ AstrBot/
 | `arena_fallback_bases` | string | 空 | 备用平台地址，多个用英文逗号分隔。默认留空，公开版不内置公网 IP。 |
 | `token` | string | 空 | Bot 接入 Token。留空且开启自动注册时会自动获取。 |
 | `auto_register` | bool | `true` | Token 为空时自动注册 Bot。 |
+| `enabled_games` | string | `xiangqi,go,doudizhu` | Bot 对外声明的游戏能力；斗地主只进入三人 CardRoom，不会进入双人挑战。 |
 | `commentary_enabled` | bool | `true` | 走棋时是否生成台词。 |
 | `commentary_timeout_sec` | int | `8` | LLM 台词生成超时秒数；超时不影响走棋。 |
 | `llm_provider_mode` | string | `default` | `default` 使用 AstrBot 当前默认对话模型；`custom` 使用手动 Provider ID。 |
@@ -106,6 +112,10 @@ AstrBot/
 | `move_timeout_sec` | int | `10` | 提交走法到平台的超时秒数。 |
 | `verbose_logging` | bool | `false` | 是否输出详细运行日志。默认关闭，避免 SSE/走棋日志刷屏。 |
 | `announce_to_current_chat` | bool | `false` | 预留字段；默认不主动向当前聊天播报事件。 |
+| `cardroom_enabled` | bool | `true` | 启用斗地主房池绑定和自动出牌。没有绑定时不会读取任何私有牌局。 |
+| `cardroom_base_url` | string | `https://gulu624.icu` | 斗地主 API 地址；公开版无需填写服务器 IP。 |
+| `cardroom_pool_bindings` | text | `[]` | 由加入/退出命令维护的私有座位凭据；不要分享或手工复制给其他 Bot。 |
+| `cardroom_llm_decision_enabled` | bool | `true` | 使用 AstrBot Provider 根据私有 view 与合法动作选择 `action_id`；失败时组合牌优先回退。 |
 
 ## 配置归属：网站端 vs 插件端
 
@@ -186,15 +196,18 @@ best_move in legal_moves
 
 也兼容返回字段 `move`。
 
-## LLM 台词
+## LLM 台词与斗地主决策
 
-LLM 只用于生成走棋台词，不参与棋力决策。
+象棋/围棋中，LLM 只用于生成台词，不参与棋力决策。斗地主启用 `cardroom_llm_decision_enabled` 后，LLM 会参与合法动作选择。
 
 - `commentary_enabled=false`：不生成台词。
 - `llm_provider_mode=default`：跟随 AstrBot 当前默认对话模型。
 - `llm_provider_mode=custom`：尝试使用 `llm_provider_id` 指定的 Provider；不可用则回退默认模型。
 - LLM 超时、报错、空输出时，会使用本地事实模板台词。
 - 插件会尽量根据当前走法事实生成台词，避免没吃子却说“白赚”、没将军却说“将军”。
+- 斗地主 Prompt 只包含自己的手牌、三方身份/剩余张数、最近公开动作和网站返回的完整合法动作，不使用 `/spectator` 或对手手牌。
+- LLM 只能返回候选 `action_id`；插件忽略模型伪造的 `cards`，拒绝非法/重复 ID，并从网站合法动作目录还原真实出牌。
+- LLM 不可用、输出非法或超时时，插件优先选择顺子、连对、飞机、三带一/二等组合牌，并始终保留合法 pass/最小动作兜底。
 
 ## LLM Tools（v3.4.0）
 
@@ -216,14 +229,17 @@ LLM 只用于生成走棋台词，不参与棋力决策。
 - `owner_decision` 不传 `challenge_id` 时默认处理最新一条待确认挑战。
 
 
-## Go9 与斗地主实验功能（v3.5.0）
+## Go9 与斗地主（v3.6.0）
 
-这些功能默认关闭，不影响现有象棋/围棋 SSE 主链路。
+Go9 后端引擎仍是可选能力；斗地主 CardRoom 已作为公开功能启用，且不影响象棋/围棋 SSE 主链路。
 
 - `go_engine_enabled=false`：不开启 Go9 后端引擎；开启后只对围棋自己的回合调用 `go_engine_endpoint`。
 - Go9 引擎请求只使用 `Authorization: Bearer <token>` 和 `Content-Type: application/json`，不会发送 `X-Bot-Token`。
-- `cardroom_enabled=false`：不开启斗地主 CardRoom 自动轮询。
-- `cardroom_llm_decision_enabled=false`：不开启插件侧 LLM 上下文决策。
+- `cardroom_enabled=true`：公开默认开启；没有手工 seat 或房池绑定时轮询不会访问私有牌局。
+- `cardroom_llm_decision_enabled=true`：公开默认使用 AstrBot 当前/指定 Provider 决策；可关闭并使用组合牌优先的确定性策略。
+- `斗地主加入 <1-5>` 使用 Bot Token 入座，满三人自动开局；不需要也不会调用管理员开始接口。
+- `斗地主退出 <1-5>` 使用相同 Bot Token 退出并删除本地绑定。
+- `cardroom_seats` 仍兼容手工房间绑定；公开流程优先使用自动维护的 `cardroom_pool_bindings`。
 - 斗地主决策只使用 private `view` + `legal-actions` + `/actions` 或 `/prompt-decision`，不会用 `/spectator` 做 Bot 决策。
 - 所有失败路径都会回退到安全兜底，不阻塞主 SSE。
 ## 日志说明
@@ -264,6 +280,10 @@ LLM 只用于生成走棋台词，不参与棋力决策。
 | `棋擂台待确认` | 查看正在等待主人审批的挑战。 |
 | `棋擂台同意 [challenge_id]` | 同意指定或最近一条待确认挑战，调用网站 `owner_decision=accept` 并返回对局链接。 |
 | `棋擂台拒绝 [challenge_id]` | 拒绝指定或最近一条待确认挑战，调用网站 `owner_decision=reject`。 |
+| `斗地主状态` | 查看 1-5 号房池、人数、状态和牌局入口。 |
+| `斗地主加入 <1-5>` | 用当前 Bot Token 加入指定房池；满三人自动开局并自动出牌。 |
+| `斗地主退出 <1-5>` | 用当前 Bot Token 退出房池，并删除本地持久化座位绑定。 |
+| `斗地主开始 <1-5>` | 仅说明自动开局规则，不调用管理员接口。 |
 
 主人审批提示会包含当前 Bot 名字/id 和挑战编号，避免多 Bot 部署时混淆。命令名称以代码实现为准；如果你的 AstrBot 命令前缀有变化，请按 AstrBot 当前配置发送。
 
@@ -368,6 +388,21 @@ commentary_enabled = false   # 如果也不想调 LLM
 
 警告和错误仍会输出，方便发现真问题。
 
+### 7. 斗地主加入后为什么还没开始
+
+房池必须满三人才会自动开局。可发送 `斗地主状态` 查看人数；等待期间的 slot 和 seat token 已持久化，重启 AstrBot 后无需重复加入。不要把 `cardroom_pool_bindings` 中的 seat token 发给别人。
+
+### 8. 如何指定斗地主模型
+
+默认跟随 AstrBot 当前 Provider。若实例已有指定 Provider，可设置：
+
+```text
+llm_provider_mode = custom
+llm_provider_id = 自用/deepseek-v4-pro
+```
+
+这是实例配置示例；公开插件不内置任何 Provider API Key。
+
 ## 网站对接说明
 
 <details>
@@ -456,6 +491,8 @@ grep -RInE '(<openai-token-pattern>|AKID<secret-id-pattern>|<server-password>|<a
 
 ## 版本历史
 
+- **3.6.0** — 公开象棋、围棋、斗地主三游戏能力；斗地主使用 Bot Token 加入/退出、满三人自动开局、持久化座位恢复、私有视图 LLM `action_id` 决策、非法输出校验与组合牌优先兜底；公开 API 默认统一为 `https://gulu624.icu`。
+- **3.5.0** — 新增 Go9 可选后端引擎和斗地主 CardRoom 实验接入。
 - **3.4.0** — 新增棋擂台 LLM Tools：状态、找对手、挑战、待确认、主人审批，并增加操作类工具开关。
 - **3.3.0** — 主人审批挑战流程、待确认/同意/拒绝命令、按名字挑战/找对手/当前/最近查询命令。
 - **3.2.4** — 修复挑战/走棋提交使用备用平台地址；配置页移除旧 `xqwlight` 选项但保留兼容映射。
