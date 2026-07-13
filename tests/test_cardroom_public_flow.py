@@ -115,6 +115,12 @@ class CardRoomPublicFlowTests(unittest.TestCase):
         self.assertEqual(resolved[0]["cards"], ["4S", "4H"])
         self.assertEqual(resolved[1]["cards"], [])
 
+    def test_llm_system_prompt_requires_stable_action_ids(self):
+        prompt = plugin_mod.ChessArenaPlugin._CARDROOM_DECISION_SESSION_PROMPT
+        self.assertIn("action_id", prompt)
+        self.assertIn("candidates", prompt)
+        self.assertIn("不能自造或改写 cards", prompt)
+
     def test_combination_first_fallback_plays_supported_multi_card_families(self):
         plugin = make_plugin()
         cases = [
